@@ -1,0 +1,14 @@
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.dylib
+*.app/
+.DS_Store
+.idea/
+.vscode/
+*.user
+*.log
