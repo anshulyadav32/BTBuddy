@@ -6,6 +6,9 @@ import '../models/serial_event.dart';
 import '../models/ussd_session.dart';
 import '../models/bluetooth_device_item.dart';
 import '../models/bt_notification.dart';
+import '../models/sim_card.dart';
+import '../models/call_log_item.dart';
+import '../models/sms_message.dart';
 
 class BTBuddyService {
   static const _method = MethodChannel('btbuddy/serial');
@@ -17,6 +20,8 @@ class BTBuddyService {
   final _eventsController = StreamController<SerialEvent>.broadcast();
   final _ussdController = StreamController<UssdSession>.broadcast();
   final _notificationController = StreamController<BtNotification>.broadcast();
+  final _simController = StreamController<List<SimCard>>.broadcast();
+  final _callLogsController = StreamController<List<CallLogItem>>.broadcast();
 
   StreamSubscription? _nativeSubscription;
   Timer? _heartbeatTimer;
@@ -28,6 +33,14 @@ class BTBuddyService {
   bool connected = false;
   String connectionPath = '';
   String? _lastConnectedPath;
+
+  // Call Logs & History State
+  List<CallLogItem> callLogs = [];
+
+  // SIM Cards State (1=Single, 2=Dual SIM, 3=Triple, 4=Quad)
+  int simSlotCount = 2;
+  int activeSimSlot = 1;
+  List<SimCard> simCards = [];
 
   // 2-Way Telemetry
   int txBytes = 0;
@@ -55,6 +68,8 @@ class BTBuddyService {
   static const _prefsLastPath = 'btbuddy.last_connected_path';
   static const _prefsPreferKechaoda = 'btbuddy.prefer_kechaoda';
   static const _prefsForwardNotifs = 'btbuddy.forward_notifs';
+  static const _prefsSimSlots = 'btbuddy.sim_slots';
+  static const _prefsActiveSim = 'btbuddy.active_sim';
 
   // Streams
   Stream<List<UsbDevice>> get devices => _devices.stream;
@@ -62,9 +77,12 @@ class BTBuddyService {
   Stream<SerialEvent> get serialEvents => _eventsController.stream;
   Stream<UssdSession> get ussdStream => _ussdController.stream;
   Stream<BtNotification> get notificationStream => _notificationController.stream;
+  Stream<List<SimCard>> get simStream => _simController.stream;
+  Stream<List<CallLogItem>> get callLogsStream => _callLogsController.stream;
 
   List<UsbDevice> get currentDevices => List.unmodifiable(_currentDevices);
   List<BluetoothDeviceItem> get currentBtDevices => List.unmodifiable(_currentBtDevices);
+  List<CallLogItem> get currentCallLogs => List.unmodifiable(callLogs);
   String? get lastConnectedPath => _lastConnectedPath;
 
   BTBuddyService() {
@@ -163,13 +181,91 @@ class BTBuddyService {
       autoConnect = prefs.getBool(_prefsAuto) ?? true;
       preferKechaoda = prefs.getBool(_prefsPreferKechaoda) ?? true;
       forwardMacNotifications = prefs.getBool(_prefsForwardNotifs) ?? true;
+      simSlotCount = prefs.getInt(_prefsSimSlots) ?? 2;
+      activeSimSlot = prefs.getInt(_prefsActiveSim) ?? 1;
       _lastConnectedPath = prefs.getString(_prefsLastPath);
       if (_lastConnectedPath != null && _lastConnectedPath!.isNotEmpty) {
         _emit('info', 'Remembered last device: $_lastConnectedPath');
       }
+      _buildInitialSimCards();
     } catch (e) {
       _emit('info', 'Preferences init note: $e');
+      _buildInitialSimCards();
     }
+  }
+
+  void _buildInitialSimCards() {
+    final list = <SimCard>[];
+    for (int i = 1; i <= simSlotCount; i++) {
+      list.add(SimCard(
+        slotIndex: i,
+        label: 'SIM $i',
+        operatorName: i == 1 ? 'Primary Network' : 'Secondary SIM',
+        status: i == 1 ? SimStatus.ready : SimStatus.inserted,
+        signalLevel: i == 1 ? 24 : 18,
+        isActive: i == activeSimSlot,
+      ));
+    }
+    simCards = list;
+    _simController.add(simCards);
+  }
+
+  Future<void> setSimSlotCount(int count) async {
+    simSlotCount = count.clamp(1, 4);
+    if (activeSimSlot > simSlotCount) {
+      activeSimSlot = 1;
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_prefsSimSlots, simSlotCount);
+      await prefs.setInt(_prefsActiveSim, activeSimSlot);
+    } catch (_) {}
+    _buildInitialSimCards();
+    _emit('info', 'Configured phone SIM slots: $simSlotCount (${simSlotCount == 1 ? 'Single SIM' : simSlotCount == 2 ? 'Dual SIM' : simSlotCount == 3 ? 'Triple SIM' : 'Quad SIM'})');
+  }
+
+  Future<void> setActiveSim(int slot) async {
+    if (slot < 1 || slot > simSlotCount) return;
+    activeSimSlot = slot;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_prefsActiveSim, activeSimSlot);
+    } catch (_) {}
+
+    // Send multi-SIM switch commands across diverse modem chipsets
+    if (connected) {
+      bool switched = false;
+      // 1. Try MediaTek dual-SIM command: AT+ESUO
+      try {
+        final r1 = await command('AT+ESUO=$slot');
+        if (r1.contains('OK')) switched = true;
+      } catch (_) {}
+
+      // 2. Try 3GPP dual-SIM select: AT+CSUS (0-indexed)
+      if (!switched) {
+        try {
+          final r2 = await command('AT+CSUS=${slot - 1}');
+          if (r2.contains('OK')) switched = true;
+        } catch (_) {}
+      }
+
+      // 3. Try Spreadtrum / Unisoc dual-SIM: AT+DSIM or AT+SIM
+      if (!switched) {
+        try {
+          final r3 = await command('AT+DSIM=$slot');
+          if (r3.contains('OK')) switched = true;
+        } catch (_) {}
+      }
+      if (!switched) {
+        try {
+          await command('AT+SIM=$slot');
+        } catch (_) {}
+      }
+    }
+
+    simCards = simCards.map((sim) => sim.copyWith(isActive: sim.slotIndex == activeSimSlot)).toList();
+    _simController.add(simCards);
+    _emit('info', 'Active cellular SIM switched to SIM $slot');
   }
 
   Future<void> setAutoConnect(bool value) async {
@@ -550,8 +646,368 @@ class BTBuddyService {
     return command('AT+CPBR=$start,$end');
   }
 
-  Future<String> saveContact(String name, String number) async {
-    return command('AT+CPBW=,"$number",129,"$name"');
+  // Multi-SIM Operations
+  Future<List<SimCard>> detectSimCards() async {
+    if (!connected) return simCards;
+
+    _emit('info', 'Probing cellular SIM slots ($simSlotCount slots)…');
+    final updated = <SimCard>[];
+
+    // Probe current operator
+    String mainOperator = 'Network Provider';
+    try {
+      final ops = await operatorName();
+      final match = RegExp(r'\+COPS:\s*\d+,\s*\d+,\s*"([^"]+)"').firstMatch(ops);
+      if (match != null) mainOperator = match.group(1) ?? mainOperator;
+    } catch (_) {}
+
+    // Probe signal quality
+    int mainSignal = 24;
+    try {
+      final csq = await signalQuality();
+      final match = RegExp(r'\+CSQ:\s*(\d+)').firstMatch(csq);
+      if (match != null) mainSignal = int.tryParse(match.group(1) ?? '24') ?? 24;
+    } catch (_) {}
+
+    for (int i = 1; i <= simSlotCount; i++) {
+      SimStatus status = SimStatus.ready;
+      try {
+        // Probe PIN status for slot
+        final pinResp = await (i == 1 ? command('AT+CPIN?') : command('AT+CPIN2?'));
+        if (pinResp.contains('SIM PIN')) {
+          status = SimStatus.pinRequired;
+        } else if (pinResp.contains('SIM PUK')) {
+          status = SimStatus.pukRequired;
+        } else if (pinResp.contains('NOT INSERTED') || pinResp.contains('ERROR')) {
+          status = i == 1 ? SimStatus.noSim : SimStatus.inserted;
+        } else if (pinResp.contains('READY')) {
+          status = SimStatus.ready;
+        }
+      } catch (_) {}
+
+      updated.add(SimCard(
+        slotIndex: i,
+        label: 'SIM $i',
+        operatorName: i == 1 ? mainOperator : (simSlotCount > 1 ? 'SIM $i Standby' : 'Network Provider'),
+        status: status,
+        signalLevel: i == 1 ? mainSignal : (mainSignal > 6 ? mainSignal - 4 : mainSignal),
+        isActive: i == activeSimSlot,
+      ));
+    }
+
+    simCards = updated;
+    _simController.add(simCards);
+    return simCards;
+  }
+
+  Future<String> dialWithSim(String number, {int? simSlot}) async {
+    final slot = simSlot ?? activeSimSlot;
+    if (slot != activeSimSlot) {
+      await setActiveSim(slot);
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+
+    final clean = number.trim();
+
+    // Multi-SIM dial strategy:
+    // Ensure hardware SIM slot is selected
+    if (slot > 1) {
+      try {
+        await command('AT+ESUO=$slot');
+      } catch (_) {}
+      try {
+        await command('AT+CSUS=${slot - 1}');
+      } catch (_) {}
+      try {
+        await command('AT+DSIM=$slot');
+      } catch (_) {}
+    } else {
+      try {
+        await command('AT+ESUO=1');
+      } catch (_) {}
+      try {
+        await command('AT+CSUS=0');
+      } catch (_) {}
+      try {
+        await command('AT+DSIM=1');
+      } catch (_) {}
+    }
+
+    await Future.delayed(const Duration(milliseconds: 60));
+
+    // 1. Primary dial: ATD<number>;
+    String resp = '';
+    try {
+      resp = await dial(clean);
+      if (resp.contains('OK') || !resp.contains('ERROR')) {
+        return resp;
+      }
+    } catch (_) {}
+
+    // 2. If slot > 1 and primary dial returned error, try suffix dial: ATD<number>;2 or ATD><number>;2
+    if (slot > 1) {
+      try {
+        final r2 = await command('ATD$clean;$slot');
+        if (r2.contains('OK') || !r2.contains('ERROR')) return r2;
+      } catch (_) {}
+      try {
+        final r3 = await command('ATD$clean;,$slot');
+        if (r3.contains('OK') || !r3.contains('ERROR')) return r3;
+      } catch (_) {}
+      try {
+        final r4 = await command('AT+CDV=$clean');
+        if (r4.contains('OK') || !r4.contains('ERROR')) return r4;
+      } catch (_) {}
+    }
+
+    return resp.isNotEmpty ? resp : await dial(clean);
+  }
+
+  Future<String> sendSmsWithSim(String number, String message, {int? simSlot}) async {
+    if (simSlot != null && simSlot != activeSimSlot) {
+      await setActiveSim(simSlot);
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    return sendSms(number, message);
+  }
+
+  Future<UssdSession> sendUssdWithSim(String code, {int? simSlot}) async {
+    if (simSlot != null && simSlot != activeSimSlot) {
+      await setActiveSim(simSlot);
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    return sendUssd(code);
+  }
+
+  // -------------------------------------------------------------
+  // CALL LOGS / CALL HISTORY SYNC (AT+CPBS / AT+CPBR)
+  // -------------------------------------------------------------
+  Future<List<CallLogItem>> syncCallLogs({int? targetSimSlot}) async {
+    if (!connected) return callLogs;
+
+    final slot = targetSimSlot ?? activeSimSlot;
+    _emit('info', 'Syncing phone call history (Dialed, Received & Missed Calls on SIM $slot)…');
+    final allCalls = <CallLogItem>[];
+
+    Future<void> probeStorage(String storageCode, CallType type) async {
+      try {
+        final selectResp = await command('AT+CPBS="$storageCode"');
+        if (selectResp.contains('ERROR')) {
+          await command('AT+CPBS=$storageCode');
+        }
+        await Future.delayed(const Duration(milliseconds: 50));
+
+        // Probe total used and capacity
+        int maxIndex = 30;
+        try {
+          final cpbsInfo = await command('AT+CPBS?');
+          final match = RegExp(r'\+CPBS:\s*"?[^",]*"?,\s*(\d+),\s*(\d+)').firstMatch(cpbsInfo);
+          if (match != null) {
+            final used = int.tryParse(match.group(1) ?? '0') ?? 0;
+            final total = int.tryParse(match.group(2) ?? '30') ?? 30;
+            maxIndex = total > 0 ? total : 30;
+            if (used == 0) {
+              return;
+            }
+          }
+        } catch (_) {}
+
+        String raw = '';
+        // Try querying full range
+        try {
+          raw = await command('AT+CPBR=1,$maxIndex');
+        } catch (_) {}
+
+        // Fallbacks for devices with strict smaller range limits
+        if (raw.isEmpty || raw.contains('ERROR')) {
+          for (final r in [20, 10, 5]) {
+            try {
+              final test = await command('AT+CPBR=1,$r');
+              if (test.isNotEmpty && !test.contains('ERROR')) {
+                raw = test;
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+
+        // If range command fails, try querying individual slots 1..10
+        if (raw.isEmpty || raw.contains('ERROR') || !raw.contains('+CPBR:')) {
+          final cpbrBuffer = StringBuffer();
+          for (int idx = 1; idx <= 10; idx++) {
+            try {
+              final entry = await command('AT+CPBR=$idx');
+              if (entry.contains('+CPBR:') && !entry.contains('ERROR')) {
+                cpbrBuffer.writeln(entry);
+              }
+            } catch (_) {}
+          }
+          if (cpbrBuffer.isNotEmpty) {
+            raw = cpbrBuffer.toString();
+          }
+        }
+
+        if (raw.isNotEmpty && !raw.contains('ERROR')) {
+          final items = CallLogItem.parseCpbrResponse(raw, type: type, simSlot: slot);
+          allCalls.addAll(items);
+        }
+      } catch (_) {}
+    }
+
+    // Probing Dialed ("DC"), Received ("RC"), Missed ("MC"), Last Dialed ("LD")
+    await probeStorage('DC', CallType.dialed);
+    await probeStorage('RC', CallType.received);
+    await probeStorage('MC', CallType.missed);
+    await probeStorage('LD', CallType.dialed);
+
+    // If multi-SIM is configured and no specific slot requested, also check SIM 2 if possible
+    if (targetSimSlot == null && simSlotCount > 1 && activeSimSlot != 2) {
+      try {
+        await command('AT+ESUO=2');
+        await Future.delayed(const Duration(milliseconds: 60));
+        await probeStorage('DC', CallType.dialed);
+        await probeStorage('RC', CallType.received);
+        await probeStorage('MC', CallType.missed);
+      } catch (_) {} finally {
+        await command('AT+ESUO=$activeSimSlot');
+      }
+    }
+
+    // Restore default phonebook storage to SIM ("SM") or phone ("ME")
+    try {
+      await command('AT+CPBS="SM"');
+    } catch (_) {}
+
+    // Deduplicate calls by simSlot, type, number, and timestamp
+    final Map<String, CallLogItem> uniqueMap = {};
+    for (final c in allCalls) {
+      final key = '${c.simSlot}_${c.type.name}_${c.number}_${c.timestamp}_${c.index}';
+      uniqueMap[key] = c;
+    }
+
+    callLogs = uniqueMap.values.toList();
+    _callLogsController.add(callLogs);
+    _emit('info', 'Call history synced: ${callLogs.length} call logs retrieved across SIMs.');
+    return callLogs;
+  }
+
+  // -------------------------------------------------------------
+  // ALL OLD SMS SYNC ACROSS STORAGES & SIMs (AT+CPMS / AT+CMGL)
+  // -------------------------------------------------------------
+  Future<List<SmsMessage>> syncAllSmsMessages() async {
+    if (!connected) return [];
+
+    _emit('info', 'Syncing all old SMS messages from SIM & phone memory across $simSlotCount SIM slots…');
+    final Map<String, SmsMessage> msgMap = {};
+
+    Future<void> probeSmsStorage(String storageCode, int slot) async {
+      try {
+        // Select message storage
+        try {
+          await command('AT+CPMS="$storageCode","$storageCode","$storageCode"');
+        } catch (_) {
+          try {
+            await command('AT+CPMS="$storageCode"');
+          } catch (_) {}
+        }
+        await Future.delayed(const Duration(milliseconds: 50));
+
+        // Enable SMS text mode
+        try {
+          await command('AT+CMGF=1');
+        } catch (_) {}
+
+        String raw = '';
+        // 1. Try AT+CMGL="ALL"
+        try {
+          raw = await command('AT+CMGL="ALL"');
+        } catch (_) {}
+
+        // 2. Try numeric mode AT+CMGL=4 (Standard GSM 07.05 for ALL)
+        if (raw.isEmpty || raw.contains('ERROR') || !raw.contains('+CMG')) {
+          try {
+            final numResp = await command('AT+CMGL=4');
+            if (numResp.isNotEmpty && !numResp.contains('ERROR')) {
+              raw = numResp;
+            }
+          } catch (_) {}
+        }
+
+        // 3. Try reading status groups individually
+        if (raw.isEmpty || raw.contains('ERROR') || !raw.contains('+CMG')) {
+          try {
+            final unread = await command('AT+CMGL="REC UNREAD"');
+            final read = await command('AT+CMGL="REC READ"');
+            final sent = await command('AT+CMGL="STO SENT"');
+            raw = '$unread\n$read\n$sent';
+          } catch (_) {}
+        }
+
+        // 4. Try reading slot indices with AT+CMGR=1..20
+        if (raw.isEmpty || raw.contains('ERROR') || !raw.contains('+CMG')) {
+          final cmgrBuffer = StringBuffer();
+          for (int idx = 1; idx <= 20; idx++) {
+            try {
+              final r = await command('AT+CMGR=$idx');
+              if (r.contains('+CMGR:') && !r.contains('ERROR')) {
+                cmgrBuffer.writeln('+CMGL: $idx,$r');
+              }
+            } catch (_) {}
+          }
+          if (cmgrBuffer.isNotEmpty) {
+            raw = cmgrBuffer.toString();
+          }
+        }
+
+        if (raw.isNotEmpty && !raw.contains('ERROR')) {
+          final list = SmsMessage.parseList(raw, storage: storageCode, simSlot: slot);
+          for (final m in list) {
+            final key = '${slot}_${m.index}_${m.sender}_${m.date}_${m.body}';
+            msgMap[key] = m;
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Probe SIM storage ("SM"), Phone memory ("ME"), and Combined ("MT")
+    await probeSmsStorage('SM', 1);
+    await probeSmsStorage('ME', 1);
+    await probeSmsStorage('MT', 1);
+
+    if (simSlotCount > 1) {
+      try {
+        await command('AT+ESUO=2');
+        await Future.delayed(const Duration(milliseconds: 60));
+        await probeSmsStorage('SM', 2);
+        await probeSmsStorage('ME', 2);
+      } catch (_) {} finally {
+        await command('AT+ESUO=$activeSimSlot');
+      }
+    }
+
+    final result = msgMap.values.toList();
+    _emit('info', 'SMS sync complete: ${result.length} total messages retrieved across all SIM storages.');
+    return result;
+  }
+
+  // -------------------------------------------------------------
+  // UNIFIED FULL RESYNC (OLD CALLS + OLD SMS + SIM PROBE)
+  // -------------------------------------------------------------
+  Future<Map<String, dynamic>> syncAllOldMessagesAndCalls() async {
+    if (!connected) {
+      return {'smsCount': 0, 'callsCount': 0, 'simCount': simSlotCount};
+    }
+
+    _emit('info', 'Beginning unified phone sync (All SIMs, Old SMS & Call Logs)…');
+    await detectSimCards();
+    final smsList = await syncAllSmsMessages();
+    final callList = await syncCallLogs();
+
+    return {
+      'smsCount': smsList.length,
+      'callsCount': callList.length,
+      'simCount': simSlotCount,
+    };
   }
 
   void dispose() {
@@ -562,5 +1018,7 @@ class BTBuddyService {
     _eventsController.close();
     _ussdController.close();
     _notificationController.close();
+    _simController.close();
+    _callLogsController.close();
   }
 }

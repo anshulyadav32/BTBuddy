@@ -28,5 +28,9 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>BTBuddy requires Bluetooth access to discover, connect and manage mobile phones and serial devices.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>BTBuddy requires Bluetooth peripheral access to communicate with cellular devices and modems.</string>
 </dict>
 </plist>

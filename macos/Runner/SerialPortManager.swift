@@ -5,9 +5,17 @@ import FlutterMacOS
 final class SerialPortManager: NSObject, FlutterStreamHandler {
     private var fd: Int32 = -1
     private var eventSink: FlutterEventSink?
-    private let queue = DispatchQueue(label: "com.btbuddy.serial")
+    private let queue = DispatchQueue(label: "com.btbuddy.serial.queue", qos: .userInitiated)
     private let commandLock = NSLock()
     private var connectedPath = ""
+    private var isRunningReader = false
+
+    // Synchronized command-response mechanism
+    private let responseLock = NSLock()
+    private var isWaitingForResponse = false
+    private var pendingResponseData = Data()
+    private var responseSemaphore: DispatchSemaphore?
+    private var customStopCheck: ((String) -> Bool)?
 
     // Telemetry
     private var txBytes: Int64 = 0
@@ -18,35 +26,40 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
     func connect(path: String, baud: Int) throws {
         disconnect()
 
+        // 1. Open device (use nonblock during open to avoid hanging on carrier detect)
         let handle = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
         if handle < 0 {
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))]
+                userInfo: [NSLocalizedDescriptionKey: "Failed to open \(path): \(String(cString: strerror(errno)))"]
             )
         }
 
+        // 2. Request exclusive access
+        _ = ioctl(handle, TIOCEXCL)
+
+        // 3. Configure termios
         var options = termios()
         if tcgetattr(handle, &options) != 0 {
             close(handle)
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "tcgetattr failed"]
+                userInfo: [NSLocalizedDescriptionKey: "tcgetattr failed on \(path)"]
             )
         }
 
         cfmakeraw(&options)
-        options.c_cflag |= tcflag_t(CLOCAL | CREAD)
-        options.c_cflag &= ~tcflag_t(CSTOPB)
-        options.c_cflag &= ~tcflag_t(PARENB)
-        options.c_cflag &= ~tcflag_t(CSIZE)
-        options.c_cflag |= tcflag_t(CS8)
-        options.c_iflag &= ~tcflag_t(IXON | IXOFF | IXANY)
+        options.c_cflag |= tcflag_t(CLOCAL | CREAD | CS8)
+        options.c_cflag &= ~tcflag_t(CSTOPB | PARENB | CRTSCTS)
+        options.c_iflag &= ~tcflag_t(IXON | IXOFF | IXANY | ICRNL | INLCR | IGNCR)
+        options.c_oflag &= ~tcflag_t(OPOST | ONLCR | OCRNL)
+        options.c_lflag &= ~tcflag_t(ICANON | ECHO | ECHOE | ISIG)
+
         withUnsafeMutableBytes(of: &options.c_cc) { controlCharacters in
             controlCharacters[Int(VMIN)] = 0
-            controlCharacters[Int(VTIME)] = 0
+            controlCharacters[Int(VTIME)] = 1 // 100ms timeout per read
         }
 
         let speed = speedConstant(baud)
@@ -58,8 +71,21 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "tcsetattr failed"]
+                userInfo: [NSLocalizedDescriptionKey: "tcsetattr failed on \(path)"]
             )
+        }
+
+        // 4. Assert DTR and RTS control lines for modem readiness
+        var modemStatus: Int32 = 0
+        if ioctl(handle, TIOCMGET, &modemStatus) == 0 {
+            modemStatus |= Int32(TIOCM_DTR | TIOCM_RTS)
+            _ = ioctl(handle, TIOCMSET, &modemStatus)
+        }
+
+        // 5. Clear O_NONBLOCK so reads block with termios VTIME/VMIN
+        let currentFlags = fcntl(handle, F_GETFL, 0)
+        if currentFlags >= 0 {
+            _ = fcntl(handle, F_SETFL, currentFlags & ~O_NONBLOCK)
         }
 
         fd = handle
@@ -74,24 +100,40 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
         }
 
         startReader()
+
+        // Send initial wake-up AT probe
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            _ = try? self?.command("AT", timeout: 1.5)
+        }
     }
 
     func disconnect() {
         queue.sync {
+            isRunningReader = false
             if fd >= 0 {
+                _ = ioctl(fd, TIOCNXCL)
                 close(fd)
                 fd = -1
             }
         }
+
+        responseLock.lock()
+        if isWaitingForResponse {
+            isWaitingForResponse = false
+            responseSemaphore?.signal()
+        }
+        responseLock.unlock()
+
         if !connectedPath.isEmpty {
+            let oldPath = connectedPath
+            connectedPath = ""
             DispatchQueue.main.async {
-                self.eventSink?(["type": "disconnected", "data": self.connectedPath])
+                self.eventSink?(["type": "disconnected", "data": oldPath])
             }
         }
-        connectedPath = ""
     }
 
-    func command(_ command: String, timeout: TimeInterval = 3.5) throws -> String {
+    func command(_ commandStr: String, timeout: TimeInterval = 4.0, stopCondition: ((String) -> Bool)? = nil) throws -> String {
         commandLock.lock()
         defer { commandLock.unlock() }
 
@@ -103,7 +145,15 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
             )
         }
 
-        let normalized = command.hasSuffix("\r") ? command : command + "\r"
+        let sema = DispatchSemaphore(value: 0)
+        responseLock.lock()
+        isWaitingForResponse = true
+        pendingResponseData = Data()
+        responseSemaphore = sema
+        customStopCheck = stopCondition
+        responseLock.unlock()
+
+        let normalized = commandStr.hasSuffix("\r") ? commandStr : commandStr + "\r"
         let bytes = Array(normalized.utf8)
 
         let written = bytes.withUnsafeBytes {
@@ -111,10 +161,13 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
         }
 
         if written < 0 {
+            responseLock.lock()
+            isWaitingForResponse = false
+            responseLock.unlock()
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "Serial write failed"]
+                userInfo: [NSLocalizedDescriptionKey: "Serial write failed: \(String(cString: strerror(errno)))"]
             )
         }
 
@@ -124,24 +177,54 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
         DispatchQueue.main.async {
             self.eventSink?([
                 "type": "tx",
-                "data": command,
+                "data": commandStr,
                 "txBytes": self.txBytes,
                 "txPackets": self.txPackets
             ])
         }
 
-        return try readResponse(timeout: timeout)
+        // Wait for response or timeout
+        let result = sema.wait(timeout: .now() + timeout)
+
+        responseLock.lock()
+        isWaitingForResponse = false
+        customStopCheck = nil
+        let responseData = pendingResponseData
+        responseLock.unlock()
+
+        let text = String(data: responseData, encoding: .utf8) ??
+                   String(data: responseData, encoding: .ascii) ?? ""
+
+        if result == .timedOut && text.isEmpty {
+            // Check if still connected
+            if fd < 0 {
+                throw NSError(domain: "BTBuddy", code: 2, userInfo: [NSLocalizedDescriptionKey: "Connection lost"])
+            }
+            return ""
+        }
+
+        DispatchQueue.main.async {
+            self.eventSink?([
+                "type": "rx",
+                "data": text,
+                "rxBytes": self.rxBytes,
+                "rxPackets": self.rxPackets
+            ])
+        }
+
+        return text
     }
 
     func sendUssd(code: String) throws -> String {
-        // AT+CUSD=1,"<code_or_reply>",15
         let sanitized = code.replacingOccurrences(of: "\"", with: "")
         let cmd = "AT+CUSD=1,\"\(sanitized)\",15"
-        return try command(cmd, timeout: 6.0)
+        return try command(cmd, timeout: 8.0) { text in
+            text.contains("+CUSD:") || text.contains("\r\nOK\r\n") || text.contains("\r\nERROR\r\n")
+        }
     }
 
     func cancelUssd() throws -> String {
-        return try command("AT+CUSD=2", timeout: 2.0)
+        return try command("AT+CUSD=2", timeout: 2.5)
     }
 
     func sendSms(number: String, message: String) throws -> String {
@@ -157,133 +240,138 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
         }
 
         // Set SMS text mode
-        let modeCmd = "AT+CMGF=1\r"
-        let modeBytes = Array(modeCmd.utf8)
-        _ = modeBytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, modeBytes.count) }
-        usleep(150_000)
+        _ = try? executeDirectCommand("AT+CMGF=1\r", timeout: 2.0)
+        usleep(100_000)
 
-        // Initiate SMS to destination number
+        // Initiate SMS prompt
         let promptCmd = "AT+CMGS=\"\(number)\"\r"
-        let promptBytes = Array(promptCmd.utf8)
-        let w1 = promptBytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, promptBytes.count) }
-        if w1 < 0 {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Write failed"])
+        let promptResp = try executeDirectCommand(promptCmd, timeout: 3.5) { text in
+            text.contains(">") || text.contains("ERROR")
         }
-
-        txBytes += Int64(w1)
-        txPackets += 1
 
         DispatchQueue.main.async {
             self.eventSink?(["type": "tx", "data": "AT+CMGS=\"\(number)\""])
         }
-        usleep(350_000)
 
-        // Write message body + Ctrl+Z (0x1A)
+        usleep(150_000)
+
+        // Write message body + Ctrl+Z
         let bodyPayload = message + "\u{001A}"
-        let bodyBytes = Array(bodyPayload.utf8)
-        let w2 = bodyBytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, bodyBytes.count) }
-        if w2 < 0 {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Write message failed"])
+        let bodyResp = try executeDirectCommand(bodyPayload, timeout: 10.0) { text in
+            text.contains("+CMGS:") || text.contains("OK\r\n") || text.contains("ERROR\r\n")
         }
-
-        txBytes += Int64(w2)
-        txPackets += 1
 
         DispatchQueue.main.async {
             self.eventSink?(["type": "tx", "data": "\(message) <Ctrl-Z>"])
+            self.eventSink?(["type": "rx", "data": bodyResp.isEmpty ? promptResp : bodyResp])
         }
 
-        return try readResponse(timeout: 8.0)
+        return bodyResp.isEmpty ? promptResp : bodyResp
     }
 
-    private func readResponse(timeout: TimeInterval) throws -> String {
-        let deadline = Date().addingTimeInterval(timeout)
-        var output = Data()
-        var buffer = [UInt8](repeating: 0, count: 4096)
+    private func executeDirectCommand(_ rawCommand: String, timeout: TimeInterval, stopCondition: ((String) -> Bool)? = nil) throws -> String {
+        let sema = DispatchSemaphore(value: 0)
+        responseLock.lock()
+        isWaitingForResponse = true
+        pendingResponseData = Data()
+        responseSemaphore = sema
+        customStopCheck = stopCondition
+        responseLock.unlock()
 
-        while Date() < deadline {
-            let count = Darwin.read(fd, &buffer, buffer.count)
-            if count > 0 {
-                rxBytes += Int64(count)
-                rxPackets += 1
-                output.append(contentsOf: buffer[0..<count])
-                if let text = String(data: output, encoding: .utf8) {
-                    processUnsolicitedCodes(in: text)
-                    if text.contains("\r\nOK\r\n") ||
-                       text.contains("\r\nERROR\r\n") ||
-                       text.hasSuffix("OK\r\n") ||
-                       text.hasSuffix("ERROR\r\n") ||
-                       text.contains("+CME ERROR:") ||
-                       text.contains("+CMS ERROR:") {
-                        DispatchQueue.main.async {
-                            self.eventSink?([
-                                "type": "rx",
-                                "data": text,
-                                "rxBytes": self.rxBytes,
-                                "rxPackets": self.rxPackets
-                            ])
-                        }
-                        return text
-                    }
-                }
-            } else if count < 0 && errno != EAGAIN && errno != EWOULDBLOCK {
-                throw NSError(
-                    domain: NSPOSIXErrorDomain,
-                    code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "Serial read failed"]
-                )
-            }
-            usleep(20_000)
+        let bytes = Array(rawCommand.utf8)
+        let written = bytes.withUnsafeBytes {
+            Darwin.write(fd, $0.baseAddress, bytes.count)
         }
 
-        let text = String(data: output, encoding: .utf8) ?? ""
-        if !text.isEmpty {
-            processUnsolicitedCodes(in: text)
-            DispatchQueue.main.async {
-                self.eventSink?([
-                    "type": "rx",
-                    "data": text,
-                    "rxBytes": self.rxBytes,
-                    "rxPackets": self.rxPackets
-                ])
-            }
+        if written < 0 {
+            responseLock.lock()
+            isWaitingForResponse = false
+            responseLock.unlock()
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Serial write error"])
         }
-        return text
+
+        txBytes += Int64(written)
+        txPackets += 1
+
+        _ = sema.wait(timeout: .now() + timeout)
+
+        responseLock.lock()
+        isWaitingForResponse = false
+        customStopCheck = nil
+        let responseData = pendingResponseData
+        responseLock.unlock()
+
+        return String(data: responseData, encoding: .utf8) ?? ""
     }
 
+    // -------------------------------------------------------------
+    // DEDICATED SINGLE READER THREAD
+    // -------------------------------------------------------------
     private func startReader() {
+        isRunningReader = true
         queue.async { [weak self] in
             guard let self else { return }
             var buffer = [UInt8](repeating: 0, count: 4096)
 
-            while true {
-                if self.fd < 0 { break }
-
+            while self.isRunningReader && self.fd >= 0 {
                 let count = Darwin.read(self.fd, &buffer, buffer.count)
                 if count > 0 {
+                    let chunk = Data(buffer[0..<count])
                     self.rxBytes += Int64(count)
                     self.rxPackets += 1
-                    let data = Data(buffer[0..<count])
-                    let text = String(data: data, encoding: .utf8) ?? ""
-                    if !text.isEmpty {
-                        self.processUnsolicitedCodes(in: text)
-                        DispatchQueue.main.async {
-                            self.eventSink?([
-                                "type": "rx_async",
-                                "data": text,
-                                "rxBytes": self.rxBytes,
-                                "rxPackets": self.rxPackets
-                            ])
+
+                    self.responseLock.lock()
+                    if self.isWaitingForResponse {
+                        self.pendingResponseData.append(chunk)
+                        let currentText = String(data: self.pendingResponseData, encoding: .utf8) ??
+                                          String(data: self.pendingResponseData, encoding: .ascii) ?? ""
+
+                        var finished = false
+                        if let customCheck = self.customStopCheck {
+                            finished = customCheck(currentText)
+                        } else {
+                            finished = currentText.contains("\r\nOK\r\n") ||
+                                       currentText.contains("\r\nERROR\r\n") ||
+                                       currentText.hasSuffix("OK\r\n") ||
+                                       currentText.hasSuffix("ERROR\r\n") ||
+                                       currentText.contains("+CME ERROR:") ||
+                                       currentText.contains("+CMS ERROR:") ||
+                                       currentText.contains("\r\nBUSY\r\n") ||
+                                       currentText.contains("\r\nNO CARRIER\r\n") ||
+                                       currentText.contains("\r\nNO ANSWER\r\n")
+                        }
+
+                        if finished {
+                            self.isWaitingForResponse = false
+                            self.responseSemaphore?.signal()
+                        }
+                    } else {
+                        // Asynchronous incoming data stream
+                        if let text = String(data: chunk, encoding: .utf8), !text.isEmpty {
+                            DispatchQueue.main.async {
+                                self.eventSink?([
+                                    "type": "rx_async",
+                                    "data": text,
+                                    "rxBytes": self.rxBytes,
+                                    "rxPackets": self.rxPackets
+                                ])
+                            }
                         }
                     }
-                } else if count < 0 && errno != EAGAIN && errno != EWOULDBLOCK {
-                    DispatchQueue.main.async {
-                        self.eventSink?(["type": "error", "data": "Serial read error"])
+                    self.responseLock.unlock()
+
+                    // Parse URCs
+                    if let text = String(data: chunk, encoding: .utf8) {
+                        self.processUnsolicitedCodes(in: text)
+                    }
+                } else if count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
+                    if self.isRunningReader {
+                        DispatchQueue.main.async {
+                            self.eventSink?(["type": "error", "data": "Serial connection lost (read failed)"])
+                        }
                     }
                     break
                 }
-
-                usleep(30_000)
             }
         }
     }
@@ -299,14 +387,12 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
                     self.eventSink?(["type": "incoming_call", "data": "RING"])
                 }
             } else if trimmed.hasPrefix("+CLIP:") {
-                // Caller ID: +CLIP: "123456789",145,...
                 let components = trimmed.replacingOccurrences(of: "+CLIP:", with: "").trimmingCharacters(in: .whitespaces)
                 let number = components.components(separatedBy: ",").first?.replacingOccurrences(of: "\"", with: "") ?? ""
                 DispatchQueue.main.async {
                     self.eventSink?(["type": "incoming_clip", "data": number, "raw": trimmed])
                 }
             } else if trimmed.hasPrefix("+CMTI:") {
-                // SMS notification: +CMTI: "SM",1
                 let components = trimmed.replacingOccurrences(of: "+CMTI:", with: "").trimmingCharacters(in: .whitespaces)
                 let parts = components.components(separatedBy: ",")
                 let index = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : "1"
@@ -314,7 +400,6 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
                     self.eventSink?(["type": "incoming_sms", "data": index, "raw": trimmed])
                 }
             } else if trimmed.hasPrefix("+CUSD:") {
-                // USSD result: +CUSD: <m>,"<str>",<dcs>
                 DispatchQueue.main.async {
                     self.eventSink?(["type": "ussd_event", "data": trimmed])
                 }
@@ -329,6 +414,7 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
         case 38400: return speed_t(B38400)
         case 57600: return speed_t(B57600)
         case 115200: return speed_t(B115200)
+        case 230400: return speed_t(B230400)
         default: return speed_t(B115200)
         }
     }
@@ -343,3 +429,4 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
         return nil
     }
 }
+

@@ -24,7 +24,7 @@ void main() {
 
     // Verify 3 Consolidated Master Navigation Tabs
     expect(find.widgetWithText(Tab, 'Dashboard & Connection'), findsOneWidget);
-    expect(find.widgetWithText(Tab, 'Phone, Contacts & USSD'), findsOneWidget);
+    expect(find.widgetWithText(Tab, 'Phone & Contacts'), findsOneWidget);
     expect(find.widgetWithText(Tab, 'Messages'), findsOneWidget);
 
     // Verify Sub-Navigation Segmented Buttons in Dashboard & Connection
@@ -38,7 +38,7 @@ void main() {
     expect(find.text('Cellular Signal'), findsOneWidget);
   });
 
-  testWidgets('renders unified Phone, Contacts & USSD tab with keypad, USSD presets, and phonebook',
+  testWidgets('renders Android Phone & Contacts tab with keypad, recents, and contacts',
       (WidgetTester tester) async {
     tester.view.physicalSize = const Size(1800, 1000);
     tester.view.devicePixelRatio = 1.0;
@@ -50,31 +50,24 @@ void main() {
     await tester.pumpWidget(const BTBuddyApp());
     await tester.pump(const Duration(milliseconds: 200));
 
-    // Tap on Phone, Contacts & USSD Tab
-    await tester.tap(find.widgetWithText(Tab, 'Phone, Contacts & USSD'));
+    // Tap on Phone & Contacts Tab
+    await tester.tap(find.widgetWithText(Tab, 'Phone & Contacts'));
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pump(const Duration(milliseconds: 500));
 
-    // Verify Keypad & USSD Engine Header
-    expect(find.text('SMART KEYPAD & USSD ENGINE'), findsOneWidget);
-    expect(find.text('CALL'), findsOneWidget);
-    expect(find.text('USSD'), findsOneWidget);
+    // Verify Android Dialer Sub-Navigation
+    expect(find.text('Keypad'), findsWidgets);
+    expect(find.text('Recents'), findsWidgets);
+    expect(find.text('Contacts'), findsWidgets);
 
-    // Verify USSD Quick Presets
-    expect(find.text('*123# (Main Balance)'), findsOneWidget);
-    expect(find.text('*121# (Offers & Packs)'), findsOneWidget);
-    expect(find.text('*100# (Account Info)'), findsOneWidget);
+    // Verify Android Keypad Grid digits
+    expect(find.text('1'), findsWidgets);
+    expect(find.text('2'), findsWidgets);
+    expect(find.text('ABC'), findsWidgets);
+    expect(find.text('0'), findsWidgets);
 
-    // Verify Live Status Card
-    expect(find.text('LIVE CALL & DTMF STATUS'), findsOneWidget);
-    expect(find.text('USSD SESSION RESPONDER'), findsOneWidget);
-
-    // Verify Contacts Panel
-    expect(find.textContaining('PHONEBOOK & CONTACTS'), findsOneWidget);
-    expect(find.text('Search contacts by name or number...'), findsOneWidget);
-
-    // Verify History Panel
-    expect(find.textContaining('USSD Execution History'), findsOneWidget);
+    // Verify Dual SIM or Call button
+    expect(find.textContaining('SIM'), findsWidgets);
   });
 
   testWidgets('switches sub-tabs in Dashboard & Connection hub',

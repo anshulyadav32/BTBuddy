@@ -8,6 +8,8 @@ import '../models/phone_contact.dart';
 import '../models/ussd_session.dart';
 import '../models/bluetooth_device_item.dart';
 import '../models/bt_notification.dart';
+import '../models/sim_card.dart';
+import '../models/call_log_item.dart';
 import '../services/btbuddy_service.dart';
 import '../widgets/logo_badge.dart';
 
@@ -43,14 +45,23 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   List<UsbDevice> devices = [];
   List<BluetoothDeviceItem> btDevices = [];
   List<SmsMessage> messages = [];
-  List<PhoneContact> contacts = [];
   SmsMessage? selectedMessage;
+  List<PhoneContact> contacts = [];
+  List<CallLogItem> callLogs = [];
+  String contactSearchQuery = '';
   String deviceFilter = 'All'; // 'All', 'USB', 'Bluetooth'
+  int historySubFilter = 0; // 0=All, 1=Dialed, 2=Received, 3=Missed, 4=USSD
+
+  // Multi-SIM State
+  List<SimCard> simCards = [];
+  int selectedSimSlot = 1;
 
   // Subscriptions & Timers
   StreamSubscription? eventSub;
   StreamSubscription? ussdSub;
   StreamSubscription? notifSub;
+  StreamSubscription? simSub;
+  StreamSubscription? callLogSub;
   Timer? devicePoll;
   Timer? callTimer;
 
@@ -58,6 +69,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   String status = 'Disconnected';
   String? connectedPath;
   bool busy = false;
+  bool _syncingAll = false;
   bool _refreshing = false;
   bool _scanning = false;
   bool _scanningBt = false;
@@ -94,6 +106,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _tabController = TabController(length: 3, vsync: this);
     connectedPath = service.connectionPath;
     status = service.connected ? 'Connected' : 'Disconnected';
+    simCards = service.simCards;
+    selectedSimSlot = service.activeSimSlot;
+    callLogs = service.callLogs;
 
     eventSub = service.serialEvents.listen((event) {
       if (!mounted) return;
@@ -132,6 +147,19 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           incomingCallerName = match.isNotEmpty ? match.first.name : '';
         });
       }
+    });
+
+    simSub = service.simStream.listen((list) {
+      if (!mounted) return;
+      setState(() {
+        simCards = list;
+        selectedSimSlot = service.activeSimSlot;
+      });
+    });
+
+    callLogSub = service.callLogsStream.listen((list) {
+      if (!mounted) return;
+      setState(() => callLogs = list);
     });
 
     _refresh();
@@ -213,6 +241,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           connectedPath = null;
         }
       });
+
+      // Auto-connect to preferred device if available and not currently connected
+      if (!service.connected && !busy && service.shouldAutoConnectNow()) {
+        final target = service.selectedDevice;
+        if (target != null) {
+          _addLog('info', 'Auto-connecting to preferred device ${target.name} (${target.path})…');
+          _connectToDevice(target);
+        }
+      }
     } catch (e) {
       _addLog('error', 'Device refresh error: $e');
     } finally {
@@ -306,38 +343,85 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   Future<void> _syncPhoneCompanionData() async {
     if (status != 'Connected') return;
-    _addLog('info', 'Syncing phone companion status & messages…');
+    _addLog('info', 'Syncing phone companion status, SIMs, old messages & call history…');
+
+    Future<void> safeRun(Future<dynamic> Function() action) async {
+      if (status != 'Connected') return;
+      try {
+        await action();
+        await Future.delayed(const Duration(milliseconds: 100));
+      } catch (_) {}
+    }
+
+    await safeRun(() => service.model());
+    await safeRun(() => service.firmware());
+    await safeRun(() => service.signalQuality());
+    await safeRun(() => service.batteryStatus());
+    await safeRun(() => service.operatorName());
+    await safeRun(() => service.detectSimCards());
+    await safeRun(() => _syncAllOldData(silent: true));
+    await safeRun(() => _loadContacts());
+  }
+
+  Future<void> _syncAllOldData({bool silent = false}) async {
+    if (status != 'Connected') return;
+    setState(() => _syncingAll = true);
+    _addLog('info', 'Syncing all old SMS messages and call history across SIMs…');
     try {
-      await Future.delayed(const Duration(milliseconds: 150));
-      await service.model();
-      await Future.delayed(const Duration(milliseconds: 150));
-      await service.firmware();
-      await Future.delayed(const Duration(milliseconds: 150));
-      await service.signalQuality();
-      await Future.delayed(const Duration(milliseconds: 150));
-      await service.batteryStatus();
-      await Future.delayed(const Duration(milliseconds: 150));
-      await service.operatorName();
-      await _loadSms();
-      await _loadContacts();
-    } catch (_) {}
+      final res = await service.syncAllOldMessagesAndCalls();
+      final msgs = await service.syncAllSmsMessages();
+      if (mounted) {
+        setState(() {
+          messages = msgs;
+          callLogs = service.callLogs;
+          if (messages.isNotEmpty && selectedMessage == null) {
+            selectedMessage = messages.first;
+          }
+        });
+        if (!silent) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Synced ${res['smsCount']} SMS messages & ${res['callsCount']} call logs across ${res['simCount']} SIM slots.',
+              ),
+              backgroundColor: Colors.green.shade800,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      _addLog('error', 'Full sync error: $e');
+    } finally {
+      if (mounted) setState(() => _syncingAll = false);
+    }
+  }
+
+  Future<void> _loadCallLogs() async {
+    if (status != 'Connected') return;
+    try {
+      final logs = await service.syncCallLogs();
+      if (mounted) setState(() => callLogs = logs);
+    } catch (e) {
+      _addLog('error', 'Call logs fetch error: $e');
+    }
   }
 
   // -------------------------------------------------------------
   // USSD ACTIONS
   // -------------------------------------------------------------
-  Future<void> _sendUssd(String code) async {
+  Future<void> _sendUssd(String code, {int? simSlot}) async {
     final c = code.trim();
     if (c.isEmpty) return;
     ussdCodeController.text = c;
+    final slot = simSlot ?? selectedSimSlot;
     setState(() => busy = true);
-    _addLog('info', 'Dialing USSD: $c…');
+    _addLog('info', 'Dialing USSD: $c on SIM $slot…');
     try {
-      final session = await service.sendUssd(c);
+      final session = await service.sendUssdWithSim(c, simSlot: slot);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('USSD ${session.statusLabel}: ${session.response.replaceAll('\n', ' ')}'),
+          content: Text('USSD (SIM $slot) ${session.statusLabel}: ${session.response.replaceAll('\n', ' ')}'),
           backgroundColor: session.isInteractive ? Colors.amber.shade800 : Colors.blueGrey.shade800,
         ),
       );
@@ -502,13 +586,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   Future<void> _loadSms() async {
     if (status != 'Connected') return;
     try {
-      final raw = await service.listSms();
-      final parsed = SmsMessage.parseList(raw);
+      final list = await service.syncAllSmsMessages();
       if (mounted) {
         setState(() {
-          messages = parsed;
-          if (parsed.isNotEmpty && selectedMessage == null) {
-            selectedMessage = parsed.first;
+          messages = list;
+          if (list.isNotEmpty && selectedMessage == null) {
+            selectedMessage = list.first;
           }
         });
       }
@@ -526,7 +609,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     } catch (_) {}
   }
 
-  Future<void> _sendSms() async {
+  Future<void> _sendSms({int? simSlot}) async {
     final number = smsRecipientController.text.trim();
     final text = smsBodyController.text.trim();
     if (number.isEmpty || text.isEmpty) {
@@ -535,15 +618,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       );
       return;
     }
+    final slot = simSlot ?? selectedSimSlot;
     setState(() => busy = true);
-    _addLog('info', 'Sending SMS to $number…');
+    _addLog('info', 'Sending SMS to $number via SIM $slot…');
     try {
-      final r = await service.sendSms(number, text);
+      final r = await service.sendSmsWithSim(number, text, simSlot: slot);
       _addLog('rx', r);
       smsBodyController.clear();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('SMS Sent!'), backgroundColor: Colors.green),
+        SnackBar(content: Text('SMS Sent via SIM $slot!'), backgroundColor: Colors.green),
       );
       await _loadSms();
     } catch (e) {
@@ -557,17 +641,29 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
-  Future<void> _dial(String target) async {
+  Future<void> _dial(String target, {int? simSlot}) async {
     final num = target.trim();
     if (num.isEmpty) return;
+    final slot = simSlot ?? selectedSimSlot;
     dialerNumberController.text = num;
+    setState(() {
+      selectedSimSlot = slot;
+      service.activeSimSlot = slot;
+    });
+
+    // Handle USSD / MMI codes typed directly on Android dialer (e.g. *123#)
+    if (num.startsWith('*') || num.contains('#')) {
+      await _sendUssd(num, simSlot: slot);
+      return;
+    }
+
     setState(() {
       callState = 'DIALING';
       callDurationSeconds = 0;
     });
-    _addLog('info', 'Dialing $num…');
+    _addLog('info', 'Dialing $num via SIM $slot…');
     try {
-      final r = await service.dial(num);
+      final r = await service.dialWithSim(num, simSlot: slot);
       _addLog('rx', r);
       setState(() => callState = 'CALL ACTIVE');
       callTimer?.cancel();
@@ -658,6 +754,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     eventSub?.cancel();
     ussdSub?.cancel();
     notifSub?.cancel();
+    simSub?.cancel();
+    callLogSub?.cancel();
     devicePoll?.cancel();
     callTimer?.cancel();
     _tabController.dispose();
@@ -690,7 +788,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           controller: _tabController,
           tabs: const [
             Tab(icon: Icon(Icons.dashboard_customize_outlined, size: 18), text: 'Dashboard & Connection'),
-            Tab(icon: Icon(Icons.phone_in_talk_outlined, size: 18), text: 'Phone, Contacts & USSD'),
+            Tab(icon: Icon(Icons.phone_in_talk_outlined, size: 18), text: 'Phone & Contacts'),
             Tab(icon: Icon(Icons.chat_bubble_outline, size: 18), text: 'Messages'),
           ],
         ),
@@ -729,11 +827,47 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             ),
           ),
           const SizedBox(width: 8),
+
+          // Number of SIMs Live Indicator Badge
+          if (isConnected) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.orange.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: Colors.orangeAccent.withValues(alpha: 0.6),
+                  width: 1.2,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.sim_card, size: 14, color: Colors.orangeAccent),
+                  const SizedBox(width: 6),
+                  Text(
+                    '${service.simSlotCount} SIMs (Active: SIM $selectedSimSlot)',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 10,
+                      color: Colors.orangeAccent,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+
           // Refresh / Sync Button
           FilledButton.tonalIcon(
-            onPressed: isConnected ? _syncPhoneCompanionData : _refresh,
-            icon: const Icon(Icons.sync, size: 16),
-            label: Text(isConnected ? 'Sync Phone' : 'Scan'),
+            onPressed: isConnected
+                ? (_syncingAll ? null : () => _syncAllOldData())
+                : _refresh,
+            icon: _syncingAll
+                ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.sync, size: 16),
+            label: Text(_syncingAll ? 'Syncing…' : (isConnected ? 'Sync Old Msg & Call (${service.simSlotCount} SIMs)' : 'Scan')),
           ),
           const SizedBox(width: 12),
         ],
@@ -1209,6 +1343,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           ),
           const SizedBox(height: 16),
 
+          // Cellular Multi-SIM Slots Management
+          _multiSimManagerCard(scheme, isConnected),
+          const SizedBox(height: 16),
+
           // Audio Profiles & Quick Actions
           Card(
             child: Padding(
@@ -1401,756 +1539,1013 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     );
   }
 
+  Widget _multiSimManagerCard(ColorScheme scheme, bool isConnected) {
+    final count = service.simSlotCount;
+    final activeSlot = service.activeSimSlot;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 12,
+              runSpacing: 10,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.sim_card, size: 22, color: Colors.orangeAccent),
+                    const SizedBox(width: 10),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'CELLULAR SIM CARDS & MULTI-SIM SLOTS',
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                        ),
+                        Text(
+                          'Active SIM Slot: SIM $activeSlot | Total Slots: $count (${count == 1 ? "Single SIM" : count == 2 ? "Dual SIM" : count == 3 ? "Triple SIM" : "Quad SIM"})',
+                          style: TextStyle(fontSize: 11, color: scheme.onSurface.withValues(alpha: 0.6)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                Wrap(
+                  spacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text('Slots:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: scheme.onSurface.withValues(alpha: 0.8))),
+                    DropdownButton<int>(
+                      value: count,
+                      isDense: true,
+                      underline: const SizedBox(),
+                      items: const [
+                        DropdownMenuItem(value: 1, child: Text('1 SIM (Single)')),
+                        DropdownMenuItem(value: 2, child: Text('2 SIMs (Dual)')),
+                        DropdownMenuItem(value: 3, child: Text('3 SIMs (Triple)')),
+                        DropdownMenuItem(value: 4, child: Text('4 SIMs (Quad)')),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) {
+                          setState(() => service.setSimSlotCount(v));
+                        }
+                      },
+                    ),
+                    IconButton.filledTonal(
+                      icon: const Icon(Icons.refresh, size: 16),
+                      tooltip: 'Probe SIM Status',
+                      onPressed: isConnected ? () => service.detectSimCards() : null,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final isWide = constraints.maxWidth > 550;
+                final items = List.generate(count, (i) {
+                  final slot = i + 1;
+                  final sim = simCards.length >= slot
+                      ? simCards[slot - 1]
+                      : SimCard(slotIndex: slot, label: 'SIM $slot', isActive: slot == activeSlot);
+                  final isActive = slot == activeSlot;
+
+                  return Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: isActive
+                          ? scheme.primaryContainer.withValues(alpha: 0.25)
+                          : scheme.surfaceContainerHighest.withValues(alpha: 0.3),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: isActive ? scheme.primary.withValues(alpha: 0.6) : scheme.outline.withValues(alpha: 0.15),
+                        width: isActive ? 1.5 : 1.0,
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(Icons.sim_card_outlined, size: 18, color: isActive ? scheme.primary : Colors.grey),
+                                const SizedBox(width: 6),
+                                Text(
+                                  'SIM $slot',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 14,
+                                    color: isActive ? scheme.primary : scheme.onSurface,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: isActive ? Colors.green.withValues(alpha: 0.2) : Colors.grey.withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                isActive ? 'ACTIVE DEFAULT' : 'STANDBY',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                  color: isActive ? Colors.greenAccent : Colors.grey,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          sim.operatorName,
+                          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        Text(
+                          sim.status.label,
+                          style: TextStyle(fontSize: 11, color: scheme.onSurface.withValues(alpha: 0.6)),
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Icon(Icons.signal_cellular_alt, size: 14, color: isActive ? Colors.greenAccent : Colors.grey),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: LinearProgressIndicator(
+                                value: (sim.signalLevel / 31).clamp(0.0, 1.0),
+                                backgroundColor: scheme.outline.withValues(alpha: 0.1),
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  isActive ? Colors.greenAccent : scheme.primary.withValues(alpha: 0.5),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              '${sim.signalPercent}%',
+                              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 6),
+                              side: BorderSide(color: isActive ? Colors.green.withValues(alpha: 0.5) : scheme.outline.withValues(alpha: 0.3)),
+                            ),
+                            onPressed: isConnected
+                                ? () {
+                                    setState(() {
+                                      selectedSimSlot = slot;
+                                      service.setActiveSim(slot);
+                                    });
+                                  }
+                                : null,
+                            icon: Icon(isActive ? Icons.check_circle : Icons.radio_button_unchecked, size: 14, color: isActive ? Colors.greenAccent : null),
+                            label: Text(isActive ? 'Active for Calls/SMS' : 'Switch to SIM $slot', style: const TextStyle(fontSize: 11)),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                });
+
+                if (isWide && count > 1) {
+                  return Row(
+                    children: items.map((w) => Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 4), child: w))).toList(),
+                  );
+                } else {
+                  return Column(
+                    children: items.map((w) => Padding(padding: const EdgeInsets.only(bottom: 8), child: w)).toList(),
+                  );
+                }
+              },
+            ),
+            const Divider(height: 24),
+            Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.storage, size: 16, color: Colors.cyanAccent),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Synced Data: ${messages.length} SMS • ${callLogs.length} Call Logs across ${service.simSlotCount} SIMs',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: scheme.onSurface.withValues(alpha: 0.75)),
+                    ),
+                  ],
+                ),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  ),
+                  onPressed: isConnected && !_syncingAll ? () => _syncAllOldData() : null,
+                  icon: _syncingAll
+                      ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                      : const Icon(Icons.sync_alt, size: 16),
+                  label: Text(_syncingAll ? 'Syncing All SIMs…' : 'Sync Old SMS & Calls from All SIMs', style: const TextStyle(fontSize: 12)),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   // -------------------------------------------------------------
-  // TAB 2: PHONE, USSD & CONTACTS (Unified Telephony Hub)
+  // TAB 2: ANDROID PHONE DIALER, RECENTS & CONTACTS
   // -------------------------------------------------------------
   Widget _phoneUssdContactsView(ColorScheme scheme, bool isConnected) {
+    // 0: Keypad, 1: Recents, 2: Contacts
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isWide = constraints.maxWidth >= 960;
+
+        return Column(
+          children: [
+            // Top Android Navigation Bar
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(
+                color: scheme.surface,
+                border: Border(bottom: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.3))),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: SegmentedButton<int>(
+                      style: SegmentedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      ),
+                      segments: [
+                        const ButtonSegment<int>(
+                          value: 0,
+                          icon: Icon(Icons.dialpad_rounded, size: 18),
+                          label: Text('Keypad', style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                        ButtonSegment<int>(
+                          value: 1,
+                          icon: const Icon(Icons.history_rounded, size: 18),
+                          label: Text(
+                            callLogs.isNotEmpty ? 'Recents (${callLogs.length})' : 'Recents',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                        ButtonSegment<int>(
+                          value: 2,
+                          icon: const Icon(Icons.people_alt_rounded, size: 18),
+                          label: Text(
+                            contacts.isNotEmpty ? 'Contacts (${contacts.length})' : 'Contacts',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ],
+                      selected: {phoneHubSubTab},
+                      onSelectionChanged: (set) {
+                        setState(() => phoneHubSubTab = set.first);
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // Main Body Area
+            Expanded(
+              child: isWide
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        // Left Pane: Recents or Contacts list
+                        Expanded(
+                          flex: 5,
+                          child: phoneHubSubTab == 2
+                              ? _buildAndroidContactsList(scheme, isConnected)
+                              : _buildAndroidRecentsList(scheme, isConnected),
+                        ),
+                        VerticalDivider(width: 1, color: scheme.outlineVariant.withValues(alpha: 0.3)),
+                        // Right Pane: Android Dialpad Phone Card
+                        Expanded(
+                          flex: 6,
+                          child: Center(
+                            child: SingleChildScrollView(
+                              padding: const EdgeInsets.all(24),
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(maxWidth: 400),
+                                child: _buildAndroidDialpadCard(scheme, isConnected),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  : (phoneHubSubTab == 0
+                      ? Center(
+                          child: SingleChildScrollView(
+                            padding: const EdgeInsets.all(16),
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 400),
+                              child: _buildAndroidDialpadCard(scheme, isConnected),
+                            ),
+                          ),
+                        )
+                      : (phoneHubSubTab == 1
+                          ? _buildAndroidRecentsList(scheme, isConnected)
+                          : _buildAndroidContactsList(scheme, isConnected))),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // -------------------------------------------------------------
+  // ANDROID DIALPAD CARD
+  // -------------------------------------------------------------
+  Widget _buildAndroidDialpadCard(ColorScheme scheme, bool isConnected) {
+    if (callState != 'IDLE') {
+      return _buildInCallCard(scheme, isConnected);
+    }
+
+    // Match contact from digits
+    PhoneContact? matchedContact;
+    final digits = dialerNumberController.text.replaceAll(RegExp(r'\D'), '');
+    if (digits.isNotEmpty) {
+      for (final c in contacts) {
+        final cDigits = c.number.replaceAll(RegExp(r'\D'), '');
+        if (cDigits.endsWith(digits) || cDigits.contains(digits) || c.name.toLowerCase().contains(dialerNumberController.text.toLowerCase())) {
+          matchedContact = c;
+          break;
+        }
+      }
+    }
+
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Matched Contact Preview (T9 Style)
+            if (matchedContact != null)
+              GestureDetector(
+                onTap: () {
+                  setState(() => dialerNumberController.text = matchedContact!.number);
+                },
+                child: Container(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: scheme.primaryContainer.withValues(alpha: 0.3),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.person_rounded, size: 16, color: scheme.primary),
+                      const SizedBox(width: 6),
+                      Text(
+                        matchedContact.name,
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: scheme.primary),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        '(${matchedContact.number})',
+                        style: TextStyle(fontSize: 12, color: scheme.onSurface.withValues(alpha: 0.6)),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            else
+              const SizedBox(height: 12),
+
+            // Large Formatted Phone Number Display
+            Container(
+              alignment: Alignment.center,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              child: SelectableText(
+                dialerNumberController.text.isEmpty ? ' ' : dialerNumberController.text,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 32,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1.5,
+                  fontFamily: 'monospace',
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Android Dialpad 3x4 Grid
+            _buildAndroidDialpadGrid(scheme, isConnected),
+            const SizedBox(height: 20),
+
+            // Bottom Call & Action Bar
+            Wrap(
+              alignment: WrapAlignment.center,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 12,
+              runSpacing: 10,
+              children: [
+                // Empty placeholder or Add Contact button
+                if (dialerNumberController.text.isNotEmpty && matchedContact == null)
+                  IconButton(
+                    icon: const Icon(Icons.person_add_outlined, size: 22),
+                    tooltip: 'Add to contacts',
+                    onPressed: () {
+                      contactNumberController.text = dialerNumberController.text;
+                      contactNameController.clear();
+                      _showAddContactDialog();
+                    },
+                  ),
+
+                // Call Button(s)
+                if (service.simSlotCount > 1)
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    alignment: WrapAlignment.center,
+                    children: List.generate(service.simSlotCount, (index) {
+                      final slot = index + 1;
+                      return FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: slot == 1 ? Colors.green.shade700 : Colors.teal.shade700,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+                        ),
+                        onPressed: isConnected && dialerNumberController.text.trim().isNotEmpty
+                            ? () {
+                                setState(() => selectedSimSlot = slot);
+                                _dial(dialerNumberController.text.trim(), simSlot: slot);
+                              }
+                            : null,
+                        icon: const Icon(Icons.phone_rounded, size: 18),
+                        label: Text(
+                          'SIM $slot',
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                        ),
+                      );
+                    }),
+                  )
+                else
+                  FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: Colors.green.shade700,
+                      foregroundColor: Colors.white,
+                      shape: const CircleBorder(),
+                      padding: const EdgeInsets.all(18),
+                    ),
+                    onPressed: isConnected && dialerNumberController.text.trim().isNotEmpty
+                        ? () => _dial(dialerNumberController.text.trim(), simSlot: 1)
+                        : null,
+                    child: const Icon(Icons.phone_rounded, size: 28),
+                  ),
+
+                // Backspace Button
+                if (dialerNumberController.text.isNotEmpty)
+                  GestureDetector(
+                    onLongPress: () {
+                      setState(() => dialerNumberController.clear());
+                    },
+                    child: IconButton(
+                      icon: const Icon(Icons.backspace_outlined, size: 22),
+                      tooltip: 'Backspace (Hold to clear)',
+                      onPressed: () {
+                        final t = dialerNumberController.text;
+                        if (t.isNotEmpty) {
+                          setState(() => dialerNumberController.text = t.substring(0, t.length - 1));
+                        }
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------
+  // ANDROID DIALPAD 3x4 GRID
+  // -------------------------------------------------------------
+  Widget _buildAndroidDialpadGrid(ColorScheme scheme, bool isConnected) {
+    const keys = [
+      {'digit': '1', 'sub': '➿'},
+      {'digit': '2', 'sub': 'ABC'},
+      {'digit': '3', 'sub': 'DEF'},
+      {'digit': '4', 'sub': 'GHI'},
+      {'digit': '5', 'sub': 'JKL'},
+      {'digit': '6', 'sub': 'MNO'},
+      {'digit': '7', 'sub': 'PQRS'},
+      {'digit': '8', 'sub': 'TUV'},
+      {'digit': '9', 'sub': 'WXYZ'},
+      {'digit': '*', 'sub': ''},
+      {'digit': '0', 'sub': '+'},
+      {'digit': '#', 'sub': ''},
+    ];
+
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        crossAxisSpacing: 14,
+        mainAxisSpacing: 14,
+        childAspectRatio: 1.15,
+      ),
+      itemCount: keys.length,
+      itemBuilder: (context, i) {
+        final item = keys[i];
+        final digit = item['digit']!;
+        final sub = item['sub']!;
+
+        return Material(
+          color: scheme.surfaceContainerHighest.withValues(alpha: 0.45),
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: isConnected
+                ? () {
+                    setState(() => dialerNumberController.text += digit);
+                    if (callState != 'IDLE') _sendDtmf(digit);
+                  }
+                : null,
+            onLongPress: isConnected && digit == '0'
+                ? () {
+                    setState(() => dialerNumberController.text += '+');
+                    if (callState != 'IDLE') _sendDtmf('+');
+                  }
+                : null,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  digit,
+                  style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+                ),
+                if (sub.isNotEmpty)
+                  Text(
+                    sub,
+                    style: TextStyle(
+                      fontSize: 9,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.2,
+                      color: scheme.onSurface.withValues(alpha: 0.55),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // -------------------------------------------------------------
+  // ANDROID IN-CALL CARD (ACTIVE CALL)
+  // -------------------------------------------------------------
+  Widget _buildInCallCard(ColorScheme scheme, bool isConnected) {
+    final caller = dialerNumberController.text.isNotEmpty ? dialerNumberController.text : 'Unknown Contact';
+
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(28),
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Colors.green.shade900.withValues(alpha: 0.3),
+              scheme.surface,
+            ],
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Caller Avatar
+            CircleAvatar(
+              radius: 40,
+              backgroundColor: Colors.green.shade700.withValues(alpha: 0.2),
+              child: const Icon(Icons.person_rounded, size: 48, color: Colors.greenAccent),
+            ),
+            const SizedBox(height: 16),
+
+            // Caller Name/Number
+            Text(
+              caller,
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 6),
+
+            // Call Duration & SIM Badge
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.green.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.4)),
+              ),
+              child: Text(
+                callState == 'CALL ACTIVE'
+                    ? 'Connected • ${(callDurationSeconds ~/ 60).toString().padLeft(2, '0')}:${(callDurationSeconds % 60).toString().padLeft(2, '0')} (SIM $selectedSimSlot)'
+                    : 'Dialing via SIM $selectedSimSlot…',
+                style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 13),
+              ),
+            ),
+            const SizedBox(height: 32),
+
+            // In-Call Action Buttons Row
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                // Mute Mic
+                IconButton.filledTonal(
+                  iconSize: 24,
+                  padding: const EdgeInsets.all(16),
+                  icon: Icon(micMuted ? Icons.mic_off_rounded : Icons.mic_rounded),
+                  onPressed: isConnected
+                      ? () {
+                          setState(() => micMuted = !micMuted);
+                          service.setMute(micMuted);
+                        }
+                      : null,
+                ),
+
+                // Red End Call Button
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.redAccent.shade700,
+                    foregroundColor: Colors.white,
+                    shape: const CircleBorder(),
+                    padding: const EdgeInsets.all(20),
+                  ),
+                  onPressed: isConnected ? _hangup : null,
+                  child: const Icon(Icons.call_end_rounded, size: 30),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------
+  // ANDROID RECENTS (CALL LOGS) LIST
+  // -------------------------------------------------------------
+  Widget _buildAndroidRecentsList(ColorScheme scheme, bool isConnected) {
+    final filteredLogs = callLogs.where((log) {
+      if (historySubFilter == 1) return log.type == CallType.missed;
+      if (historySubFilter == 2) return log.type == CallType.received;
+      if (historySubFilter == 3) return log.type == CallType.dialed;
+      return true;
+    }).toList();
+
+    return Column(
+      children: [
+        // Top Filter Bar & Sync Button
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Expanded(
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      FilterChip(
+                        label: const Text('All'),
+                        selected: historySubFilter == 0,
+                        onSelected: (_) => setState(() => historySubFilter = 0),
+                      ),
+                      const SizedBox(width: 8),
+                      FilterChip(
+                        label: const Text('Missed'),
+                        selected: historySubFilter == 1,
+                        onSelected: (_) => setState(() => historySubFilter = 1),
+                      ),
+                      const SizedBox(width: 8),
+                      FilterChip(
+                        label: const Text('Incoming'),
+                        selected: historySubFilter == 2,
+                        onSelected: (_) => setState(() => historySubFilter = 2),
+                      ),
+                      const SizedBox(width: 8),
+                      FilterChip(
+                        label: const Text('Outgoing'),
+                        selected: historySubFilter == 3,
+                        onSelected: (_) => setState(() => historySubFilter = 3),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.tonalIcon(
+                onPressed: isConnected ? _loadCallLogs : null,
+                icon: const Icon(Icons.sync, size: 14),
+                label: const Text('Sync', style: TextStyle(fontSize: 12)),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+
+        // Call Logs List
+        Expanded(
+          child: filteredLogs.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.history_toggle_off_rounded, size: 48, color: scheme.onSurface.withValues(alpha: 0.3)),
+                        const SizedBox(height: 12),
+                        Text(
+                          isConnected ? 'No call history found. Tap Sync.' : 'Connect phone to view call history.',
+                          style: TextStyle(color: scheme.onSurface.withValues(alpha: 0.6), fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              : ListView.separated(
+                  itemCount: filteredLogs.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1, indent: 64),
+                  itemBuilder: (context, i) {
+                    final log = filteredLogs[i];
+
+                    IconData typeIcon;
+                    Color typeColor;
+                    switch (log.type) {
+                      case CallType.missed:
+                        typeIcon = Icons.call_missed_rounded;
+                        typeColor = Colors.redAccent;
+                        break;
+                      case CallType.received:
+                        typeIcon = Icons.call_received_rounded;
+                        typeColor = Colors.blueAccent;
+                        break;
+                      case CallType.dialed:
+                        typeIcon = Icons.call_made_rounded;
+                        typeColor = Colors.greenAccent;
+                        break;
+                      case CallType.unknown:
+                        typeIcon = Icons.phone_rounded;
+                        typeColor = Colors.grey;
+                        break;
+                    }
+
+                    return ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: typeColor.withValues(alpha: 0.15),
+                        child: Icon(typeIcon, color: typeColor, size: 18),
+                      ),
+                      title: Text(
+                        log.displayName,
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: log.type == CallType.missed ? Colors.redAccent : null,
+                        ),
+                      ),
+                      subtitle: Row(
+                        children: [
+                          if (log.number.isNotEmpty && log.name.isNotEmpty) ...[
+                            Text('${log.number} • ', style: const TextStyle(fontSize: 12)),
+                          ],
+                          Text(log.timestamp, style: const TextStyle(fontSize: 12)),
+                          if (service.simSlotCount > 1) ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: scheme.surfaceContainerHighest,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text('SIM ${log.simSlot}', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                            ),
+                          ],
+                        ],
+                      ),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.phone_rounded, color: Colors.green, size: 20),
+                        tooltip: 'Call ${log.number}',
+                        onPressed: isConnected
+                            ? () {
+                                dialerNumberController.text = log.number;
+                                _dial(log.number, simSlot: log.simSlot);
+                              }
+                            : null,
+                      ),
+                      onTap: () {
+                        setState(() {
+                          dialerNumberController.text = log.number;
+                          phoneHubSubTab = 0;
+                        });
+                      },
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  // -------------------------------------------------------------
+  // ANDROID CONTACTS LIST
+  // -------------------------------------------------------------
+  Widget _buildAndroidContactsList(ColorScheme scheme, bool isConnected) {
     final filteredContacts = contacts.where((c) {
       final q = contactSearchController.text.toLowerCase();
       return c.name.toLowerCase().contains(q) || c.number.contains(q);
     }).toList();
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final isWide = constraints.maxWidth >= 900;
-
-        // 1. SMART DIALER & USSD ENGINE CARD
-        final dialerCard = Card(
-          child: Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.dialpad, color: Colors.amberAccent, size: 20),
-                    const SizedBox(width: 8),
-                    const Text(
-                      'SMART KEYPAD & USSD ENGINE',
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 0.5),
-                    ),
-                    const Spacer(),
-                    if (service.activeUssdSession != null)
-                      ActionChip(
-                        avatar: const Icon(Icons.close, size: 14, color: Colors.redAccent),
-                        label: const Text('Cancel USSD', style: TextStyle(color: Colors.redAccent, fontSize: 11)),
-                        onPressed: _cancelUssd,
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-
-                // Digital Input Display with Detection Badge
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.black26,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: dialerNumberController.text.startsWith('*') || dialerNumberController.text.contains('#')
-                          ? Colors.amber.withValues(alpha: 0.4)
-                          : scheme.outlineVariant.withValues(alpha: 0.5),
-                    ),
-                  ),
-                  child: Column(
-                    children: [
-                      Row(
-                        children: [
-                          Icon(
-                            dialerNumberController.text.startsWith('*') || dialerNumberController.text.contains('#')
-                                ? Icons.tag
-                                : Icons.phone_android,
-                            size: 14,
-                            color: dialerNumberController.text.startsWith('*') || dialerNumberController.text.contains('#')
-                                ? Colors.amberAccent
-                                : Colors.greenAccent,
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            dialerNumberController.text.startsWith('*') || dialerNumberController.text.contains('#')
-                                ? 'USSD SERVICE CODE'
-                                : (dialerNumberController.text.isNotEmpty ? 'VOICE CALL NUMBER' : 'ENTER NUMBER OR CODE'),
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold,
-                              color: dialerNumberController.text.startsWith('*') || dialerNumberController.text.contains('#')
-                                  ? Colors.amberAccent
-                                  : (dialerNumberController.text.isNotEmpty ? Colors.greenAccent : Colors.grey),
-                            ),
-                          ),
-                          const Spacer(),
-                          if (dialerNumberController.text.isNotEmpty)
-                            InkWell(
-                              onTap: () => setState(() => dialerNumberController.clear()),
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(horizontal: 4),
-                                child: Text('Clear', style: TextStyle(fontSize: 11, color: Colors.grey)),
-                              ),
-                            ),
-                        ],
-                      ),
-                      TextField(
-                        controller: dialerNumberController,
-                        keyboardType: TextInputType.phone,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 2),
-                        decoration: InputDecoration(
-                          hintText: 'e.g. *123# or +1234567890',
-                          hintStyle: TextStyle(fontSize: 16, color: Colors.grey.shade600, letterSpacing: 1),
-                          border: InputBorder.none,
-                          isDense: true,
-                          contentPadding: const EdgeInsets.symmetric(vertical: 6),
-                          suffixIcon: IconButton(
-                            icon: const Icon(Icons.backspace_outlined, size: 20),
-                            onPressed: () {
-                              final text = dialerNumberController.text;
-                              if (text.isNotEmpty) {
-                                setState(() {
-                                  dialerNumberController.text = text.substring(0, text.length - 1);
-                                });
-                              }
-                            },
-                          ),
-                        ),
-                        onChanged: (_) => setState(() {}),
-                        onSubmitted: isConnected
-                            ? (v) {
-                                if (v.startsWith('*') || v.contains('#')) {
-                                  _sendUssd(v);
-                                } else {
-                                  _dial(v);
-                                }
-                              }
-                            : null,
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-
-                // Tactile DialPad Grid
-                _buildDialPadGrid(isConnected),
-                const SizedBox(height: 14),
-
-                // Primary Action Buttons Row
-                Wrap(
-                  spacing: 10,
-                  runSpacing: 8,
-                  alignment: WrapAlignment.center,
-                  children: [
-                    // CALL BUTTON
-                    FilledButton.icon(
-                      onPressed: isConnected && dialerNumberController.text.trim().isNotEmpty
-                          ? () {
-                              final text = dialerNumberController.text.trim();
-                              if (text.startsWith('*') || text.endsWith('#')) {
-                                _sendUssd(text);
-                              } else {
-                                _dial(text);
-                              }
-                            }
-                          : null,
-                      icon: const Icon(Icons.phone, size: 18),
-                      label: const Text('CALL', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                      style: FilledButton.styleFrom(
-                        backgroundColor: Colors.green.shade600,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                      ),
-                    ),
-
-                    // SEND USSD BUTTON
-                    FilledButton.icon(
-                      onPressed: isConnected && !busy && dialerNumberController.text.trim().isNotEmpty
-                          ? () => _sendUssd(dialerNumberController.text.trim())
-                          : null,
-                      icon: const Icon(Icons.send, size: 16),
-                      label: const Text('USSD', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                      style: FilledButton.styleFrom(
-                        backgroundColor: Colors.amber.shade700,
-                        foregroundColor: Colors.black,
-                        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-                      ),
-                    ),
-
-                    // HANG UP BUTTON
-                    if (callState != 'IDLE')
-                      FilledButton.tonalIcon(
-                        onPressed: isConnected ? _hangup : null,
-                        icon: const Icon(Icons.call_end, size: 18),
-                        label: const Text('HANG UP', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                        style: FilledButton.styleFrom(
-                          backgroundColor: Colors.red.withValues(alpha: 0.2),
-                          foregroundColor: Colors.redAccent,
-                          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-                        ),
-                      ),
-
-                    // ANSWER BUTTON
-                    if (isIncomingCallActive)
-                      OutlinedButton.icon(
-                        onPressed: isConnected ? _answer : null,
-                        icon: const Icon(Icons.phone_in_talk, size: 18, color: Colors.greenAccent),
-                        label: const Text('Answer', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                        style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-
-                // Quick USSD Presets
-                const Divider(height: 20),
-                const Row(
-                  children: [
-                    Icon(Icons.flash_on, size: 16, color: Colors.amberAccent),
-                    SizedBox(width: 6),
-                    Text('QUICK USSD CODES & PRESETS:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    _ussdChip('*123#', 'Main Balance', isConnected),
-                    _ussdChip('*121#', 'Offers & Packs', isConnected),
-                    _ussdChip('*100#', 'Account Info', isConnected),
-                    _ussdChip('*199#', 'Data Usage', isConnected),
-                    _ussdChip('*1#', 'My Phone Number', isConnected),
-                    _ussdChip('*99#', 'Carrier Menu', isConnected),
-                    _ussdChip('*111#', 'Customer Care', isConnected),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        );
-
-        // 2. LIVE CALL STATUS & ACTIVE USSD RESPONDER CARD
-        final liveStatusCard = Card(
-          child: Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // Live Call Telemetry
-                Row(
-                  children: [
-                    Icon(
-                      callState == 'CALL ACTIVE'
-                          ? Icons.phone_in_talk
-                          : (callState == 'DIALING' ? Icons.ring_volume : Icons.phone_paused),
-                      size: 20,
-                      color: callState == 'CALL ACTIVE'
-                          ? Colors.greenAccent
-                          : (callState == 'DIALING' ? Colors.amberAccent : Colors.grey),
-                    ),
-                    const SizedBox(width: 8),
-                    const Text('LIVE CALL & DTMF STATUS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                    const Spacer(),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: callState == 'CALL ACTIVE'
-                            ? Colors.green.withValues(alpha: 0.15)
-                            : scheme.surfaceContainerHighest.withValues(alpha: 0.3),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: callState == 'CALL ACTIVE' ? Colors.greenAccent : scheme.outlineVariant,
-                        ),
-                      ),
-                      child: Text(
-                        callState,
-                        style: TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w800,
-                          color: callState == 'CALL ACTIVE' ? Colors.greenAccent : Colors.grey,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-
-                if (callState == 'CALL ACTIVE') ...[
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.green.withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.3)),
-                    ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const Icon(Icons.timer_outlined, size: 18, color: Colors.greenAccent),
-                        const SizedBox(width: 8),
-                        Text(
-                          '${(callDurationSeconds ~/ 60).toString().padLeft(2, '0')}:${(callDurationSeconds % 60).toString().padLeft(2, '0')}',
-                          style: const TextStyle(fontSize: 22, fontFamily: 'monospace', fontWeight: FontWeight.bold, color: Colors.greenAccent),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                ],
-
-                const Text('In-Call DTMF Tones:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11)),
-                const SizedBox(height: 6),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#', 'A', 'B', 'C', 'D'].map((key) {
-                    return SizedBox(
-                      width: 40,
-                      height: 34,
-                      child: OutlinedButton(
-                        style: OutlinedButton.styleFrom(padding: EdgeInsets.zero),
-                        onPressed: isConnected ? () => _sendDtmf(key) : null,
-                        child: Text(key, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                      ),
-                    );
-                  }).toList(),
-                ),
-
-                const Divider(height: 24),
-
-                // Interactive USSD Responder
-                Row(
-                  children: [
-                    const Icon(Icons.forum_outlined, size: 18, color: Colors.amberAccent),
-                    const SizedBox(width: 8),
-                    const Text('USSD SESSION RESPONDER', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                    const Spacer(),
-                    if (service.activeUssdSession != null)
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: Colors.amber.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: const Text('Interactive', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.amberAccent)),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-
-                if (service.activeUssdSession != null || service.ussdHistory.isNotEmpty) ...[
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    constraints: const BoxConstraints(maxHeight: 120),
-                    decoration: BoxDecoration(
-                      color: Colors.black26,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.amber.withValues(alpha: 0.3)),
-                    ),
-                    child: SingleChildScrollView(
-                      child: SelectableText(
-                        service.activeUssdSession?.response ?? service.ussdHistory.last.response,
-                        style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                ],
-
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: ussdReplyController,
-                        decoration: const InputDecoration(
-                          hintText: 'Enter USSD reply (e.g. 1, 2, 0)...',
-                          border: OutlineInputBorder(),
-                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                        ),
-                        onSubmitted: isConnected ? _replyUssd : null,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    FilledButton.tonal(
-                      onPressed: isConnected && !busy ? () => _replyUssd(ussdReplyController.text) : null,
-                      child: const Text('Reply'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: ['1', '2', '3', '4', '0'].map((opt) {
-                    return ActionChip(
-                      label: Text('Opt $opt', style: const TextStyle(fontSize: 11)),
-                      onPressed: () {
-                        ussdReplyController.text = opt;
-                      },
-                    );
-                  }).toList(),
-                ),
-              ],
-            ),
-          ),
-        );
-
-        // 3. INTEGRATED CONTACTS / PHONEBOOK CARD
-        final contactsCard = Card(
-          child: Column(
+    return Column(
+      children: [
+        // Search Bar & Sync Contacts Button
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
             children: [
-              Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.contacts, size: 20, color: Colors.cyanAccent),
-                        const SizedBox(width: 8),
-                        Text(
-                          'PHONEBOOK & CONTACTS (${contacts.length})',
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                        ),
-                        const Spacer(),
-                        FilledButton.tonalIcon(
-                          onPressed: isConnected ? _loadContacts : null,
-                          icon: const Icon(Icons.sync, size: 14),
-                          label: const Text('Sync', style: TextStyle(fontSize: 12)),
-                          style: FilledButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: contactSearchController,
-                      decoration: InputDecoration(
-                        hintText: 'Search contacts by name or number...',
-                        prefixIcon: const Icon(Icons.search, size: 18),
-                        border: const OutlineInputBorder(),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        suffixIcon: contactSearchController.text.isNotEmpty
-                            ? IconButton(
-                                icon: const Icon(Icons.clear, size: 16),
-                                onPressed: () {
-                                  contactSearchController.clear();
-                                  setState(() {});
-                                },
-                              )
-                            : null,
-                      ),
-                      onChanged: (_) => setState(() {}),
-                    ),
-                  ],
+              Expanded(
+                child: TextField(
+                  controller: contactSearchController,
+                  decoration: InputDecoration(
+                    hintText: 'Search contacts…',
+                    prefixIcon: const Icon(Icons.search_rounded, size: 20),
+                    filled: true,
+                    fillColor: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(24), borderSide: BorderSide.none),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    isDense: true,
+                    suffixIcon: contactSearchController.text.isNotEmpty
+                        ? IconButton(
+                            icon: const Icon(Icons.clear, size: 16),
+                            onPressed: () {
+                              contactSearchController.clear();
+                              setState(() {});
+                            },
+                          )
+                        : null,
+                  ),
+                  onChanged: (_) => setState(() {}),
                 ),
               ),
-              const Divider(height: 1),
-              SizedBox(
-                height: isWide ? 300 : 340,
-                child: filteredContacts.isEmpty
-                    ? Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(20),
-                          child: Text(
-                            isConnected
-                                ? (contactSearchController.text.isNotEmpty
-                                    ? 'No contacts match "${contactSearchController.text}"'
-                                    : 'No contacts found on SIM. Tap Sync.')
-                                : 'Connect phone to sync and dial contacts.',
-                            style: const TextStyle(color: Colors.grey, fontSize: 12),
-                            textAlign: TextAlign.center,
-                          ),
-                        ),
-                      )
-                    : ListView.separated(
-                        itemCount: filteredContacts.length,
-                        separatorBuilder: (_, __) => const Divider(height: 1),
-                        itemBuilder: (context, i) {
-                          final c = filteredContacts[i];
-                          return ListTile(
-                            dense: true,
-                            leading: CircleAvatar(
-                              radius: 16,
-                              backgroundColor: scheme.primary.withValues(alpha: 0.15),
-                              child: Text(
-                                c.name.isNotEmpty ? c.name[0].toUpperCase() : '#',
-                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: scheme.primary),
-                              ),
-                            ),
-                            title: Text(c.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                            subtitle: Text(c.number, style: const TextStyle(fontSize: 12)),
-                            trailing: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                // Direct Call
-                                IconButton(
-                                  icon: const Icon(Icons.phone, color: Colors.green, size: 18),
-                                  tooltip: 'Call ${c.name}',
-                                  onPressed: isConnected
-                                      ? () {
-                                          setState(() => dialerNumberController.text = c.number);
-                                          _dial(c.number);
-                                        }
-                                      : null,
-                                ),
-                                // Put in Keypad / USSD
-                                IconButton(
-                                  icon: const Icon(Icons.keyboard_return, color: Colors.amberAccent, size: 18),
-                                  tooltip: 'Load into Keypad',
-                                  onPressed: () {
-                                    setState(() => dialerNumberController.text = c.number);
-                                  },
-                                ),
-                                // Send SMS
-                                IconButton(
-                                  icon: const Icon(Icons.chat_bubble_outline, color: Colors.cyanAccent, size: 18),
-                                  tooltip: 'Message ${c.name}',
-                                  onPressed: () {
-                                    smsRecipientController.text = c.number;
-                                    _tabController.animateTo(2);
-                                  },
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
+              const SizedBox(width: 8),
+              FilledButton.tonalIcon(
+                onPressed: isConnected ? _loadContacts : null,
+                icon: const Icon(Icons.sync, size: 14),
+                label: const Text('Sync', style: TextStyle(fontSize: 12)),
               ),
             ],
           ),
-        );
+        ),
+        const Divider(height: 1),
 
-        // 4. USSD SESSION HISTORY CARD
-        final ussdHistoryCard = Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.history, size: 18),
-                    const SizedBox(width: 8),
-                    Text(
-                      'USSD Execution History (${service.ussdHistory.length})',
-                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                    ),
-                    const Spacer(),
-                    if (service.ussdHistory.isNotEmpty)
-                      TextButton(
-                        onPressed: () => setState(() => service.ussdHistory.clear()),
-                        child: const Text('Clear', style: TextStyle(fontSize: 12)),
-                      ),
-                  ],
-                ),
-                const Divider(height: 12),
-                service.ussdHistory.isEmpty
-                    ? Container(
-                        padding: const EdgeInsets.all(20),
-                        alignment: Alignment.center,
-                        child: Text(
-                          isConnected ? 'No USSD sessions executed yet.' : 'Connect phone to run USSD.',
-                          style: const TextStyle(color: Colors.grey, fontSize: 12),
+        // Contacts List
+        Expanded(
+          child: filteredContacts.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.person_off_outlined, size: 48, color: scheme.onSurface.withValues(alpha: 0.3)),
+                        const SizedBox(height: 12),
+                        Text(
+                          isConnected
+                              ? (contactSearchController.text.isNotEmpty
+                                  ? 'No contacts match "${contactSearchController.text}"'
+                                  : 'No contacts found on SIM. Tap Sync.')
+                              : 'Connect phone to sync and dial contacts.',
+                          style: TextStyle(color: scheme.onSurface.withValues(alpha: 0.6), fontSize: 13),
+                          textAlign: TextAlign.center,
                         ),
-                      )
-                    : ListView.separated(
-                        shrinkWrap: true,
-                        physics: const NeverScrollableScrollPhysics(),
-                        itemCount: service.ussdHistory.take(4).length,
-                        separatorBuilder: (_, __) => const Divider(height: 10),
-                        itemBuilder: (context, i) {
-                          final sess = service.ussdHistory[i];
-                          return Container(
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: scheme.surfaceContainerHighest.withValues(alpha: 0.3),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: sess.isInteractive ? Colors.amberAccent.withValues(alpha: 0.5) : scheme.outlineVariant,
-                              ),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Text(
-                                      sess.query,
-                                      style: const TextStyle(fontWeight: FontWeight.bold, fontFamily: 'monospace', color: Colors.amberAccent, fontSize: 13),
-                                    ),
-                                    const Spacer(),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                      decoration: BoxDecoration(
-                                        color: sess.isInteractive ? Colors.amber.withValues(alpha: 0.2) : Colors.green.withValues(alpha: 0.2),
-                                        borderRadius: BorderRadius.circular(4),
-                                      ),
-                                      child: Text(
-                                        sess.statusLabel,
-                                        style: TextStyle(
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.bold,
-                                          color: sess.isInteractive ? Colors.amberAccent : Colors.greenAccent,
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    InkWell(
-                                      onTap: isConnected && !busy
-                                          ? () {
-                                              dialerNumberController.text = sess.query;
-                                              _sendUssd(sess.query);
-                                            }
-                                          : null,
-                                      child: const Padding(
-                                        padding: EdgeInsets.all(2),
-                                        child: Icon(Icons.replay, size: 16, color: Colors.cyanAccent),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 4),
-                                SelectableText(
-                                  sess.response,
-                                  style: const TextStyle(fontSize: 12),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
+                      ],
+                    ),
+                  ),
+                )
+              : ListView.separated(
+                  itemCount: filteredContacts.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1, indent: 64),
+                  itemBuilder: (context, i) {
+                    final c = filteredContacts[i];
+                    final initial = c.name.isNotEmpty ? c.name[0].toUpperCase() : '#';
+
+                    return ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: scheme.primary.withValues(alpha: 0.15),
+                        child: Text(
+                          initial,
+                          style: TextStyle(fontWeight: FontWeight.bold, color: scheme.primary),
+                        ),
                       ),
-              ],
-            ),
-          ),
-        );
-
-        // LAYOUT RESPONSIVENESS
-        if (isWide) {
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(18),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  flex: 6,
-                  child: Column(
-                    children: [
-                      dialerCard,
-                      const SizedBox(height: 16),
-                      liveStatusCard,
-                    ],
-                  ),
+                      title: Text(c.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                      subtitle: Text(c.number, style: const TextStyle(fontSize: 12)),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.chat_bubble_outline_rounded, size: 18, color: Colors.cyanAccent),
+                            tooltip: 'Send SMS',
+                            onPressed: () {
+                              smsRecipientController.text = c.number;
+                              _tabController.animateTo(2);
+                            },
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.phone_rounded, size: 20, color: Colors.green),
+                            tooltip: 'Call ${c.name}',
+                            onPressed: isConnected
+                                ? () {
+                                    dialerNumberController.text = c.number;
+                                    _dial(c.number);
+                                  }
+                                : null,
+                          ),
+                        ],
+                      ),
+                      onTap: () {
+                        setState(() {
+                          dialerNumberController.text = c.number;
+                          phoneHubSubTab = 0;
+                        });
+                      },
+                    );
+                  },
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  flex: 7,
-                  child: Column(
-                    children: [
-                      contactsCard,
-                      const SizedBox(height: 16),
-                      ussdHistoryCard,
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          );
-        } else {
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // Segmented Button Sub-navigator for Narrow Displays
-                SegmentedButton<int>(
-                  segments: [
-                    const ButtonSegment<int>(
-                      value: 0,
-                      label: Text('Keypad & USSD'),
-                      icon: Icon(Icons.dialpad, size: 16),
-                    ),
-                    ButtonSegment<int>(
-                      value: 1,
-                      label: Text('Contacts (${contacts.length})'),
-                      icon: const Icon(Icons.contacts, size: 16),
-                    ),
-                    ButtonSegment<int>(
-                      value: 2,
-                      label: Text('History (${service.ussdHistory.length})'),
-                      icon: const Icon(Icons.history, size: 16),
-                    ),
-                  ],
-                  selected: {phoneHubSubTab},
-                  onSelectionChanged: (set) => setState(() => phoneHubSubTab = set.first),
-                ),
-                const SizedBox(height: 16),
-                if (phoneHubSubTab == 0) ...[
-                  dialerCard,
-                  const SizedBox(height: 16),
-                  liveStatusCard,
-                ] else if (phoneHubSubTab == 1) ...[
-                  contactsCard,
-                ] else ...[
-                  ussdHistoryCard,
-                ],
-              ],
-            ),
-          );
-        }
-      },
+        ),
+      ],
     );
   }
 
-  Widget _buildDialPadGrid(bool isConnected) {
-    const keys = [
-      ['1', '2', '3'],
-      ['4', '5', '6'],
-      ['7', '8', '9'],
-      ['*', '0', '#'],
-    ];
-
-    return Column(
-      children: keys.map((row) {
-        return Padding(
-          padding: const EdgeInsets.symmetric(vertical: 3),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: row.map((key) {
-              return Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 5),
-                child: SizedBox(
-                  width: 72,
-                  height: 44,
-                  child: FilledButton.tonal(
-                    onPressed: isConnected
-                        ? () {
-                            setState(() {
-                              dialerNumberController.text += key;
-                            });
-                            _sendDtmf(key);
-                          }
-                        : null,
-                    child: Text(key, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-              );
-            }).toList(),
+  void _showAddContactDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Add Contact'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: contactNameController,
+              decoration: const InputDecoration(labelText: 'Name', border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: contactNumberController,
+              decoration: const InputDecoration(labelText: 'Phone Number', border: OutlineInputBorder()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              final name = contactNameController.text.trim();
+              final number = contactNumberController.text.trim();
+              if (name.isNotEmpty && number.isNotEmpty) {
+                setState(() {
+                  contacts.insert(0, PhoneContact(index: contacts.length + 1, name: name, number: number));
+                });
+              }
+            },
+            child: const Text('Save'),
           ),
-        );
-      }).toList(),
-    );
-  }
-
-  Widget _ussdChip(String code, String label, bool isConnected) {
-    return ActionChip(
-      avatar: const Icon(Icons.tag, size: 14, color: Colors.amberAccent),
-      label: Text('$code ($label)'),
-      onPressed: isConnected && !busy
-          ? () {
-              setState(() => dialerNumberController.text = code);
-              _sendUssd(code);
-            }
-          : null,
+        ],
+      ),
     );
   }
 
@@ -2716,12 +3111,33 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 ),
                 const SizedBox(height: 10),
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
+                    if (service.simSlotCount > 1)
+                      Wrap(
+                        spacing: 6,
+                        children: List.generate(service.simSlotCount, (i) {
+                          final slot = i + 1;
+                          final isSel = selectedSimSlot == slot;
+                          return ChoiceChip(
+                            avatar: Icon(Icons.sim_card, size: 13, color: isSel ? Colors.greenAccent : null),
+                            label: Text('SIM $slot', style: const TextStyle(fontSize: 11)),
+                            selected: isSel,
+                            onSelected: (val) {
+                              if (val) {
+                                setState(() => selectedSimSlot = slot);
+                                service.setActiveSim(slot);
+                              }
+                            },
+                          );
+                        }),
+                      )
+                    else
+                      const SizedBox(),
                     FilledButton.icon(
-                      onPressed: isConnected ? _sendSms : null,
+                      onPressed: isConnected ? () => _sendSms(simSlot: selectedSimSlot) : null,
                       icon: const Icon(Icons.send),
-                      label: const Text('Send SMS'),
+                      label: Text(service.simSlotCount > 1 ? 'Send via SIM $selectedSimSlot' : 'Send SMS'),
                       style: FilledButton.styleFrom(
                         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
                       ),

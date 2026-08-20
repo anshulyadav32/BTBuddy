@@ -3,6 +3,7 @@ import 'package:btbuddy/models/ussd_session.dart';
 import 'package:btbuddy/models/bluetooth_device_item.dart';
 import 'package:btbuddy/models/bt_notification.dart';
 import 'package:btbuddy/models/usb_device.dart';
+import 'package:btbuddy/models/sim_card.dart';
 
 void main() {
   group('USSD Session Parser Tests', () {
@@ -165,6 +166,51 @@ void main() {
       expect(device.btConnected, isTrue);
       expect(device.btPaired, isTrue);
       expect(device.btAddress, equals('37-1e-7c-53-62-61'));
+    });
+  });
+
+  group('SimCard Model Tests', () {
+    test('creates SimCard with correct slot and properties', () {
+      const sim = SimCard(
+        slotIndex: 1,
+        label: 'SIM 1',
+        operatorName: 'Airtel',
+        status: SimStatus.ready,
+        signalLevel: 28,
+        isActive: true,
+      );
+
+      expect(sim.slotIndex, equals(1));
+      expect(sim.operatorName, equals('Airtel'));
+      expect(sim.status, equals(SimStatus.ready));
+      expect(sim.isActive, isTrue);
+      expect(sim.signalPercent, equals(90));
+      expect(sim.status.label, equals('Ready / Active'));
+      expect(sim.status.isAvailable, isTrue);
+    });
+
+    test('serializes and deserializes SimCard correctly', () {
+      final map = {
+        'slotIndex': 2,
+        'label': 'SIM 2',
+        'operatorName': 'Jio',
+        'status': 'inserted',
+        'signalLevel': 20,
+        'phoneNumber': '+123456789',
+        'isActive': false,
+      };
+
+      final sim = SimCard.fromMap(map);
+      expect(sim.slotIndex, equals(2));
+      expect(sim.operatorName, equals('Jio'));
+      expect(sim.status, equals(SimStatus.inserted));
+      expect(sim.phoneNumber, equals('+123456789'));
+      expect(sim.isActive, isFalse);
+
+      final out = sim.toMap();
+      expect(out['slotIndex'], equals(2));
+      expect(out['operatorName'], equals('Jio'));
+      expect(out['status'], equals('inserted'));
     });
   });
 }
