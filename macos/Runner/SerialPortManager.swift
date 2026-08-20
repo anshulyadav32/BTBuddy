@@ -6,7 +6,14 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
     private var fd: Int32 = -1
     private var eventSink: FlutterEventSink?
     private let queue = DispatchQueue(label: "com.btbuddy.serial")
+    private let commandLock = NSLock()
     private var connectedPath = ""
+
+    // Telemetry
+    private var txBytes: Int64 = 0
+    private var rxBytes: Int64 = 0
+    private var txPackets: Int64 = 0
+    private var rxPackets: Int64 = 0
 
     func connect(path: String, baud: Int) throws {
         disconnect()
@@ -57,7 +64,14 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
 
         fd = handle
         connectedPath = path
-        eventSink?(["type": "connected", "data": path])
+        txBytes = 0
+        rxBytes = 0
+        txPackets = 0
+        rxPackets = 0
+
+        DispatchQueue.main.async {
+            self.eventSink?(["type": "connected", "data": path])
+        }
 
         startReader()
     }
@@ -70,12 +84,17 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
             }
         }
         if !connectedPath.isEmpty {
-            eventSink?(["type": "disconnected", "data": connectedPath])
+            DispatchQueue.main.async {
+                self.eventSink?(["type": "disconnected", "data": self.connectedPath])
+            }
         }
         connectedPath = ""
     }
 
-    func command(_ command: String) throws -> String {
+    func command(_ command: String, timeout: TimeInterval = 3.5) throws -> String {
+        commandLock.lock()
+        defer { commandLock.unlock() }
+
         guard fd >= 0 else {
             throw NSError(
                 domain: "BTBuddy",
@@ -99,9 +118,82 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
             )
         }
 
-        eventSink?(["type": "tx", "data": command])
+        txBytes += Int64(written)
+        txPackets += 1
 
-        return try readResponse(timeout: 3.0)
+        DispatchQueue.main.async {
+            self.eventSink?([
+                "type": "tx",
+                "data": command,
+                "txBytes": self.txBytes,
+                "txPackets": self.txPackets
+            ])
+        }
+
+        return try readResponse(timeout: timeout)
+    }
+
+    func sendUssd(code: String) throws -> String {
+        // AT+CUSD=1,"<code_or_reply>",15
+        let sanitized = code.replacingOccurrences(of: "\"", with: "")
+        let cmd = "AT+CUSD=1,\"\(sanitized)\",15"
+        return try command(cmd, timeout: 6.0)
+    }
+
+    func cancelUssd() throws -> String {
+        return try command("AT+CUSD=2", timeout: 2.0)
+    }
+
+    func sendSms(number: String, message: String) throws -> String {
+        commandLock.lock()
+        defer { commandLock.unlock() }
+
+        guard fd >= 0 else {
+            throw NSError(
+                domain: "BTBuddy",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Serial device is not connected"]
+            )
+        }
+
+        // Set SMS text mode
+        let modeCmd = "AT+CMGF=1\r"
+        let modeBytes = Array(modeCmd.utf8)
+        _ = modeBytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, modeBytes.count) }
+        usleep(150_000)
+
+        // Initiate SMS to destination number
+        let promptCmd = "AT+CMGS=\"\(number)\"\r"
+        let promptBytes = Array(promptCmd.utf8)
+        let w1 = promptBytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, promptBytes.count) }
+        if w1 < 0 {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Write failed"])
+        }
+
+        txBytes += Int64(w1)
+        txPackets += 1
+
+        DispatchQueue.main.async {
+            self.eventSink?(["type": "tx", "data": "AT+CMGS=\"\(number)\""])
+        }
+        usleep(350_000)
+
+        // Write message body + Ctrl+Z (0x1A)
+        let bodyPayload = message + "\u{001A}"
+        let bodyBytes = Array(bodyPayload.utf8)
+        let w2 = bodyBytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, bodyBytes.count) }
+        if w2 < 0 {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Write message failed"])
+        }
+
+        txBytes += Int64(w2)
+        txPackets += 1
+
+        DispatchQueue.main.async {
+            self.eventSink?(["type": "tx", "data": "\(message) <Ctrl-Z>"])
+        }
+
+        return try readResponse(timeout: 8.0)
     }
 
     private func readResponse(timeout: TimeInterval) throws -> String {
@@ -112,13 +204,25 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
         while Date() < deadline {
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count > 0 {
+                rxBytes += Int64(count)
+                rxPackets += 1
                 output.append(contentsOf: buffer[0..<count])
                 if let text = String(data: output, encoding: .utf8) {
+                    processUnsolicitedCodes(in: text)
                     if text.contains("\r\nOK\r\n") ||
                        text.contains("\r\nERROR\r\n") ||
                        text.hasSuffix("OK\r\n") ||
-                       text.hasSuffix("ERROR\r\n") {
-                        eventSink?(["type": "rx", "data": text])
+                       text.hasSuffix("ERROR\r\n") ||
+                       text.contains("+CME ERROR:") ||
+                       text.contains("+CMS ERROR:") {
+                        DispatchQueue.main.async {
+                            self.eventSink?([
+                                "type": "rx",
+                                "data": text,
+                                "rxBytes": self.rxBytes,
+                                "rxPackets": self.rxPackets
+                            ])
+                        }
                         return text
                     }
                 }
@@ -134,7 +238,15 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
 
         let text = String(data: output, encoding: .utf8) ?? ""
         if !text.isEmpty {
-            eventSink?(["type": "rx", "data": text])
+            processUnsolicitedCodes(in: text)
+            DispatchQueue.main.async {
+                self.eventSink?([
+                    "type": "rx",
+                    "data": text,
+                    "rxBytes": self.rxBytes,
+                    "rxPackets": self.rxPackets
+                ])
+            }
         }
         return text
     }
@@ -149,11 +261,19 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
 
                 let count = Darwin.read(self.fd, &buffer, buffer.count)
                 if count > 0 {
+                    self.rxBytes += Int64(count)
+                    self.rxPackets += 1
                     let data = Data(buffer[0..<count])
                     let text = String(data: data, encoding: .utf8) ?? ""
                     if !text.isEmpty {
+                        self.processUnsolicitedCodes(in: text)
                         DispatchQueue.main.async {
-                            self.eventSink?(["type": "rx_async", "data": text])
+                            self.eventSink?([
+                                "type": "rx_async",
+                                "data": text,
+                                "rxBytes": self.rxBytes,
+                                "rxPackets": self.rxPackets
+                            ])
                         }
                     }
                 } else if count < 0 && errno != EAGAIN && errno != EWOULDBLOCK {
@@ -164,6 +284,40 @@ final class SerialPortManager: NSObject, FlutterStreamHandler {
                 }
 
                 usleep(30_000)
+            }
+        }
+    }
+
+    private func processUnsolicitedCodes(in raw: String) {
+        let lines = raw.components(separatedBy: .newlines)
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            if trimmed == "RING" {
+                DispatchQueue.main.async {
+                    self.eventSink?(["type": "incoming_call", "data": "RING"])
+                }
+            } else if trimmed.hasPrefix("+CLIP:") {
+                // Caller ID: +CLIP: "123456789",145,...
+                let components = trimmed.replacingOccurrences(of: "+CLIP:", with: "").trimmingCharacters(in: .whitespaces)
+                let number = components.components(separatedBy: ",").first?.replacingOccurrences(of: "\"", with: "") ?? ""
+                DispatchQueue.main.async {
+                    self.eventSink?(["type": "incoming_clip", "data": number, "raw": trimmed])
+                }
+            } else if trimmed.hasPrefix("+CMTI:") {
+                // SMS notification: +CMTI: "SM",1
+                let components = trimmed.replacingOccurrences(of: "+CMTI:", with: "").trimmingCharacters(in: .whitespaces)
+                let parts = components.components(separatedBy: ",")
+                let index = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : "1"
+                DispatchQueue.main.async {
+                    self.eventSink?(["type": "incoming_sms", "data": index, "raw": trimmed])
+                }
+            } else if trimmed.hasPrefix("+CUSD:") {
+                // USSD result: +CUSD: <m>,"<str>",<dcs>
+                DispatchQueue.main.async {
+                    self.eventSink?(["type": "ussd_event", "data": trimmed])
+                }
             }
         }
     }

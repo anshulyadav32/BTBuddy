@@ -10,6 +10,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  shared_preferences: ^2.3.0
 
 dev_dependencies:
   flutter_test:
@@ -18,3 +19,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/
+    - assets/btbuddy_logo.png
+  config:
+    enable-swift-package-manager: false
