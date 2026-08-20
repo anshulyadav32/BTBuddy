@@ -51,7 +51,7 @@ class LogoBadge extends StatelessWidget {
         SizedBox(width: spacing),
         Flexible(
           child: Text(
-            'BTBuddy',
+            'ControlBuddy',
             style: Theme.of(context).textTheme.titleLarge?.copyWith(
                   fontWeight: FontWeight.w800,
                   letterSpacing: 0.3,

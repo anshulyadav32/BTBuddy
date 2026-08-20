@@ -20,7 +20,7 @@ void main() {
 
     // Verify Title & LogoBadge
     expect(find.byType(LogoBadge), findsWidgets);
-    expect(find.text('BTBuddy'), findsWidgets);
+    expect(find.text('ControlBuddy'), findsWidgets);
 
     // Verify 3 Consolidated Master Navigation Tabs
     expect(find.widgetWithText(Tab, 'Dashboard & Connection'), findsOneWidget);
@@ -30,7 +30,6 @@ void main() {
     // Verify Sub-Navigation Segmented Buttons in Dashboard & Connection
     expect(find.byType(SegmentedButton<int>), findsWidgets);
     expect(find.text('Overview & Telemetry'), findsOneWidget);
-    expect(find.text('BT Notifier'), findsWidgets);
     expect(find.text('AT Terminal & Logs'), findsWidgets);
 
     // Verify Metric Cards & Status
@@ -87,12 +86,6 @@ void main() {
     await tester.tap(find.text('Bluetooth & Eject (0)').first);
     await tester.pump(const Duration(milliseconds: 300));
     expect(find.text('BLUETOOTH DEVICE MANAGER & EJECT'), findsOneWidget);
-
-    // Tap on BT Notifier segment
-    await tester.ensureVisible(find.text('BT Notifier').first);
-    await tester.tap(find.text('BT Notifier').first);
-    await tester.pump(const Duration(milliseconds: 300));
-    expect(find.text('PUSH NOTIFICATION TO PHONE (BT NOTIFIER)'), findsOneWidget);
 
     // Tap on AT Terminal segment
     await tester.ensureVisible(find.text('AT Terminal & Logs').first);

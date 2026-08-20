@@ -11,6 +11,7 @@ import '../models/bt_notification.dart';
 import '../models/sim_card.dart';
 import '../models/call_log_item.dart';
 import '../services/btbuddy_service.dart';
+import '../utils/at_error_helper.dart';
 import '../widgets/logo_badge.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -64,6 +65,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   StreamSubscription? callLogSub;
   Timer? devicePoll;
   Timer? callTimer;
+  Timer? _scrollDebounceTimer;
 
   int baud = 115200;
   String status = 'Disconnected';
@@ -112,18 +114,25 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
     eventSub = service.serialEvents.listen((event) {
       if (!mounted) return;
-      setState(() {
-        logs.add(event);
-        if (event.type == 'connected') {
+      if (logs.length > 250) {
+        logs.removeRange(0, logs.length - 150);
+      }
+      logs.add(event);
+      if (event.type == 'connected') {
+        setState(() {
           status = 'Connected';
           connectedPath = service.connectionPath;
-        }
-        if (event.type == 'disconnected') {
+        });
+      } else if (event.type == 'disconnected') {
+        setState(() {
           status = 'Disconnected';
           connectedPath = null;
           isIncomingCallActive = false;
-        }
-      });
+        });
+      } else if (_tabController.index == 0 && dashboardSubTab == 3) {
+        // Redraw only if user is actively watching AT Terminal tab
+        setState(() {});
+      }
       _parseSerialEvent(event);
       _scrollLog();
     });
@@ -165,12 +174,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _refresh();
     _refreshBtDevices();
 
+    // Lightweight disconnected polling only
     devicePoll = Timer.periodic(
-      const Duration(seconds: 4),
+      const Duration(seconds: 8),
       (_) {
-        _refresh();
-        if (service.connected) {
-          _refreshBtDevices();
+        if (!service.connected && !busy && !_scanning && !_refreshing) {
+          _refresh();
         }
       },
     );
@@ -302,17 +311,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         phoneManufacturer = device.manufacturer;
       });
       await _send('AT');
+      _showSuccessBanner('Connected to ${device.name}', title: 'Device Ready', icon: Icons.bluetooth_connected);
       await _syncPhoneCompanionData();
     } catch (e) {
       _addLog('error', 'Connection failed: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to connect to ${device.name}: $e'),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-      }
+      _showErrorBanner(
+        e.toString(),
+        contextTitle: 'Failed to Connect to ${device.name}',
+        onRetry: () => _connectToDevice(device),
+      );
     } finally {
       if (mounted) {
         setState(() {
@@ -624,17 +631,23 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     try {
       final r = await service.sendSmsWithSim(number, text, simSlot: slot);
       _addLog('rx', r);
+      if (r.contains('ERROR') || r.contains('CMS ERROR') || r.contains('CME ERROR')) {
+        _showErrorBanner(
+          r,
+          contextTitle: 'SMS Sending Failed (SIM $slot)',
+          onRetry: () => _sendSms(simSlot: slot),
+        );
+        return;
+      }
       smsBodyController.clear();
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('SMS Sent via SIM $slot!'), backgroundColor: Colors.green),
-      );
+      _showSuccessBanner('Message sent to $number via SIM $slot', title: 'SMS Delivered', icon: Icons.send_rounded);
       await _loadSms();
     } catch (e) {
       _addLog('error', 'Send SMS failed: $e');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Send failed: $e'), backgroundColor: Colors.redAccent),
+      _showErrorBanner(
+        e.toString(),
+        contextTitle: 'SMS Send Error',
+        onRetry: () => _sendSms(simSlot: slot),
       );
     } finally {
       if (mounted) setState(() => busy = false);
@@ -665,6 +678,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     try {
       final r = await service.dialWithSim(num, simSlot: slot);
       _addLog('rx', r);
+      if (r.contains('ERROR') || r.contains('NO CARRIER') || r.contains('BUSY') || r.contains('NO DIALTONE')) {
+        setState(() => callState = 'IDLE');
+        _showErrorBanner(
+          r,
+          contextTitle: 'Call Not Placed (SIM $slot)',
+          onRetry: () => _dial(num, simSlot: slot),
+        );
+        return;
+      }
       setState(() => callState = 'CALL ACTIVE');
       callTimer?.cancel();
       callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -673,6 +695,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     } catch (e) {
       _addLog('error', 'Dial failed: $e');
       setState(() => callState = 'IDLE');
+      _showErrorBanner(
+        e.toString(),
+        contextTitle: 'Call Error',
+        onRetry: () => _dial(num, simSlot: slot),
+      );
     }
   }
 
@@ -733,24 +760,134 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   void _addLog(String type, String data) {
     if (!mounted) return;
+    if (logs.length > 250) {
+      logs.removeRange(0, logs.length - 150);
+    }
     setState(() => logs.add(SerialEvent(type: type, data: data)));
     _scrollLog();
   }
 
+  void _showErrorBanner(String rawError, {String? contextTitle, VoidCallback? onRetry}) {
+    if (!mounted) return;
+    final cleanExplanation = AtErrorHelper.formatError(rawError, context: contextTitle ?? '');
+    final icon = AtErrorHelper.getIcon(rawError);
+    final suggestedAction = AtErrorHelper.getSuggestedAction(rawError);
+
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        backgroundColor: const Color(0xFF221115),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: Colors.redAccent.withValues(alpha: 0.6), width: 1.5),
+        ),
+        duration: const Duration(seconds: 5),
+        content: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.redAccent.withValues(alpha: 0.2),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, color: Colors.redAccent, size: 20),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (contextTitle != null && contextTitle.isNotEmpty)
+                    Text(
+                      contextTitle,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
+                    ),
+                  Text(
+                    cleanExplanation,
+                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        action: onRetry != null
+            ? SnackBarAction(
+                label: suggestedAction ?? 'Retry',
+                textColor: Colors.amberAccent,
+                onPressed: onRetry,
+              )
+            : null,
+      ),
+    );
+  }
+
+  void _showSuccessBanner(String message, {String? title, IconData? icon}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        backgroundColor: const Color(0xFF0D2017),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: Colors.greenAccent.withValues(alpha: 0.6), width: 1.5),
+        ),
+        duration: const Duration(seconds: 4),
+        content: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.greenAccent.withValues(alpha: 0.2),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon ?? Icons.check_circle_outline_rounded, color: Colors.greenAccent, size: 20),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (title != null && title.isNotEmpty)
+                    Text(
+                      title,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
+                    ),
+                  Text(
+                    message,
+                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _scrollLog() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (logScrollController.hasClients) {
-        logScrollController.animateTo(
-          logScrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 150),
-          curve: Curves.easeOut,
-        );
+    _scrollDebounceTimer?.cancel();
+    _scrollDebounceTimer = Timer(const Duration(milliseconds: 100), () {
+      if (mounted && logScrollController.hasClients) {
+        logScrollController.jumpTo(logScrollController.position.maxScrollExtent);
       }
     });
   }
 
   @override
   void dispose() {
+    _scrollDebounceTimer?.cancel();
     eventSub?.cancel();
     ussdSub?.cancel();
     notifSub?.cancel();
@@ -1144,16 +1281,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 ),
                 const ButtonSegment<int>(
                   value: 3,
-                  label: Text('BT Notifier'),
-                  icon: Icon(Icons.notifications_active_outlined, size: 16),
-                ),
-                const ButtonSegment<int>(
-                  value: 4,
                   label: Text('AT Terminal & Logs'),
                   icon: Icon(Icons.terminal_outlined, size: 16),
                 ),
               ],
-              selected: {dashboardSubTab},
+              selected: {dashboardSubTab.clamp(0, 3)},
               onSelectionChanged: (set) => setState(() => dashboardSubTab = set.first),
             ),
           ),
@@ -1162,12 +1294,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         // 3. ACTIVE SUB-VIEW CONTENT
         Expanded(
           child: IndexedStack(
-            index: dashboardSubTab,
+            index: dashboardSubTab.clamp(0, 3),
             children: [
               _dashboardOverviewSubView(scheme, isConnected),
               _connectionsView(scheme, isConnected),
               _bluetoothManagerView(scheme, isConnected),
-              _btNotifierView(scheme, isConnected),
               Padding(padding: const EdgeInsets.all(18), child: _consolePanel(scheme, isConnected)),
             ],
           ),
@@ -1648,30 +1779,87 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                                 ),
                               ],
                             ),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: isActive ? Colors.green.withValues(alpha: 0.2) : Colors.grey.withValues(alpha: 0.15),
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Text(
-                                isActive ? 'ACTIVE DEFAULT' : 'STANDBY',
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold,
-                                  color: isActive ? Colors.greenAccent : Colors.grey,
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.edit_note_rounded, size: 18),
+                                  tooltip: 'Edit SIM Details (Company & Number)',
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(),
+                                  onPressed: () => _showEditSimDialog(sim),
                                 ),
-                              ),
+                                const SizedBox(width: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                  decoration: BoxDecoration(
+                                    color: isActive ? Colors.green.withValues(alpha: 0.2) : Colors.grey.withValues(alpha: 0.15),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    isActive ? 'ACTIVE DEFAULT' : 'STANDBY',
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                      color: isActive ? Colors.greenAccent : Colors.grey,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ],
                         ),
                         const SizedBox(height: 8),
-                        Text(
-                          sim.operatorName,
-                          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                        // Carrier / Company Name
+                        Row(
+                          children: [
+                            const Icon(Icons.business_rounded, size: 14, color: Colors.cyanAccent),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                sim.operatorName,
+                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
                         ),
+                        const SizedBox(height: 4),
+                        // Phone Number
+                        InkWell(
+                          onTap: () => _showEditSimDialog(sim),
+                          borderRadius: BorderRadius.circular(4),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 2),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.phone_android_rounded,
+                                  size: 14,
+                                  color: sim.phoneNumber != null && sim.phoneNumber!.isNotEmpty ? Colors.greenAccent : Colors.grey,
+                                ),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    sim.phoneNumber != null && sim.phoneNumber!.isNotEmpty
+                                        ? sim.phoneNumber!
+                                        : 'No number set (Tap to add)',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: sim.phoneNumber != null && sim.phoneNumber!.isNotEmpty ? FontWeight.w600 : FontWeight.normal,
+                                      fontStyle: sim.phoneNumber != null && sim.phoneNumber!.isNotEmpty ? FontStyle.normal : FontStyle.italic,
+                                      color: sim.phoneNumber != null && sim.phoneNumber!.isNotEmpty ? scheme.onSurface : scheme.onSurface.withValues(alpha: 0.5),
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 4),
                         Text(
                           sim.status.label,
                           style: TextStyle(fontSize: 11, color: scheme.onSurface.withValues(alpha: 0.6)),
@@ -1989,11 +2177,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     alignment: WrapAlignment.center,
                     children: List.generate(service.simSlotCount, (index) {
                       final slot = index + 1;
+                      final sim = simCards.length >= slot ? simCards[slot - 1] : null;
+                      final op = sim?.operatorName ?? 'SIM $slot';
+                      final num = sim?.phoneNumber;
+
                       return FilledButton.icon(
                         style: FilledButton.styleFrom(
                           backgroundColor: slot == 1 ? Colors.green.shade700 : Colors.teal.shade700,
                           foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
                         ),
                         onPressed: isConnected && dialerNumberController.text.trim().isNotEmpty
@@ -2003,26 +2195,52 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                               }
                             : null,
                         icon: const Icon(Icons.phone_rounded, size: 18),
-                        label: Text(
-                          'SIM $slot',
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                        label: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'SIM $slot • $op',
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                            ),
+                            if (num != null && num.isNotEmpty)
+                              Text(
+                                num,
+                                style: const TextStyle(fontSize: 10, color: Colors.white70),
+                              ),
+                          ],
                         ),
                       );
                     }),
                   )
                 else
-                  FilledButton(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: Colors.green.shade700,
-                      foregroundColor: Colors.white,
-                      shape: const CircleBorder(),
-                      padding: const EdgeInsets.all(18),
-                    ),
-                    onPressed: isConnected && dialerNumberController.text.trim().isNotEmpty
-                        ? () => _dial(dialerNumberController.text.trim(), simSlot: 1)
-                        : null,
-                    child: const Icon(Icons.phone_rounded, size: 28),
-                  ),
+                  Builder(builder: (context) {
+                    final sim = simCards.isNotEmpty ? simCards.first : null;
+                    final op = sim?.operatorName ?? 'Carrier';
+                    final num = sim?.phoneNumber;
+
+                    return FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.green.shade700,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+                      ),
+                      onPressed: isConnected && dialerNumberController.text.trim().isNotEmpty
+                          ? () => _dial(dialerNumberController.text.trim(), simSlot: 1)
+                          : null,
+                      icon: const Icon(Icons.phone_rounded, size: 22),
+                      label: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Call via $op', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                          if (num != null && num.isNotEmpty)
+                            Text(num, style: const TextStyle(fontSize: 10, color: Colors.white70)),
+                        ],
+                      ),
+                    );
+                  }),
 
                 // Backspace Button
                 if (dialerNumberController.text.isNotEmpty)
@@ -2510,6 +2728,71 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     );
   }
 
+  void _showEditSimDialog(SimCard sim) {
+    final companyController = TextEditingController(text: sim.operatorName);
+    final numberController = TextEditingController(text: sim.phoneNumber ?? '');
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            const Icon(Icons.sim_card_outlined, color: Colors.cyanAccent),
+            const SizedBox(width: 8),
+            Text('Edit SIM ${sim.slotIndex} Details'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Set carrier / company name and own subscriber phone number for SIM ${sim.slotIndex}:',
+              style: const TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: companyController,
+              decoration: const InputDecoration(
+                labelText: 'Company / Carrier (e.g. Jio, Airtel, Vi)',
+                prefixIcon: Icon(Icons.business_rounded),
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: numberController,
+              decoration: const InputDecoration(
+                labelText: 'Phone Number (e.g. +91 98765 43210)',
+                prefixIcon: Icon(Icons.phone_android_rounded),
+                border: OutlineInputBorder(),
+              ),
+              keyboardType: TextInputType.phone,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await service.updateSimCardDetails(
+                sim.slotIndex,
+                operatorName: companyController.text.trim(),
+                phoneNumber: numberController.text.trim(),
+              );
+              if (mounted) setState(() => simCards = service.simCards);
+            },
+            child: const Text('Save Details'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showAddContactDialog() {
     showDialog(
       context: context,
@@ -2761,12 +3044,120 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               children: [
                 const Row(
                   children: [
+                    Icon(Icons.phone_bluetooth_speaker_rounded, color: Colors.cyanAccent),
+                    SizedBox(width: 10),
+                    Text('BT DIALER COMPANION & REMOTE CONTROLS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                // BT Dialer Quick Action Deck
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: [
+                    // Find My Phone / Anti-Lost Button
+                    FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.amber.shade800,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      ),
+                      onPressed: isConnected
+                          ? () async {
+                              await service.ringPhoneAntiLost();
+                              _addLog('info', '🔔 Find My Phone: Ringing and vibrating handset!');
+                            }
+                          : null,
+                      icon: const Icon(Icons.ring_volume_rounded, size: 18),
+                      label: const Text('Find My Phone (Anti-Lost Alarm)'),
+                    ),
+
+                    // Remote Mic Mute Toggle
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        side: BorderSide(color: micMuted ? Colors.redAccent : scheme.outline),
+                      ),
+                      onPressed: isConnected
+                          ? () async {
+                              final nextState = !micMuted;
+                              await service.setMutePhoneMic(nextState);
+                              if (mounted) setState(() => micMuted = nextState);
+                            }
+                          : null,
+                      icon: Icon(micMuted ? Icons.mic_off : Icons.mic, size: 18, color: micMuted ? Colors.redAccent : null),
+                      label: Text(micMuted ? 'Phone Mic Muted' : 'Mute Phone Mic'),
+                    ),
+
+                    // Remote Camera Trigger
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      ),
+                      onPressed: isConnected
+                          ? () async {
+                              await service.triggerRemoteCamera();
+                              _addLog('info', '📸 Remote camera capture triggered!');
+                            }
+                          : null,
+                      icon: const Icon(Icons.camera_alt_outlined, size: 18),
+                      label: const Text('Remote Camera Shutter'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+
+                // Remote Volume Slider
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHighest.withValues(alpha: 0.3),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: scheme.outline.withValues(alpha: 0.15)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.volume_up_rounded, size: 16, color: Colors.cyanAccent),
+                              SizedBox(width: 6),
+                              Text('Remote Handset Speaker & Ringer Volume:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                            ],
+                          ),
+                          Text('${volumeLevel * 10}%', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                        ],
+                      ),
+                      Slider(
+                        value: volumeLevel.toDouble(),
+                        min: 0,
+                        max: 10,
+                        divisions: 10,
+                        label: '${volumeLevel * 10}%',
+                        onChanged: isConnected
+                            ? (val) {
+                                setState(() => volumeLevel = val.toInt());
+                                service.setPhoneSpeakerVolume(val.toInt() * 10);
+                              }
+                            : null,
+                      ),
+                    ],
+                  ),
+                ),
+
+                const Divider(height: 28),
+
+                const Row(
+                  children: [
                     Icon(Icons.send_to_mobile, color: Colors.cyanAccent),
                     SizedBox(width: 10),
                     Text('PUSH NOTIFICATION TO PHONE (BT NOTIFIER)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                   ],
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 14),
                 Row(
                   children: [
                     const Text('Source App:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
@@ -2863,7 +3254,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       label: const Text('Test Mac Native Notification'),
                       onPressed: () {
                         service.showMacNotification(
-                          title: 'BTBuddy 2-Way Link',
+                          title: 'ControlBuddy 2-Way Link',
                           body: 'Mac native notification bridge is working seamlessly!',
                         );
                       },

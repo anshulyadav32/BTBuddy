@@ -187,20 +187,31 @@ class BTBuddyService {
       if (_lastConnectedPath != null && _lastConnectedPath!.isNotEmpty) {
         _emit('info', 'Remembered last device: $_lastConnectedPath');
       }
-      _buildInitialSimCards();
+      await _buildInitialSimCards();
     } catch (e) {
       _emit('info', 'Preferences init note: $e');
       _buildInitialSimCards();
     }
   }
 
-  void _buildInitialSimCards() {
+  Future<void> _buildInitialSimCards() async {
     final list = <SimCard>[];
+    SharedPreferences? prefs;
+    try {
+      prefs = await SharedPreferences.getInstance();
+    } catch (_) {}
+
     for (int i = 1; i <= simSlotCount; i++) {
+      final savedOp = prefs?.getString('btbuddy.sim_operator_$i');
+      final savedNum = prefs?.getString('btbuddy.sim_number_$i');
+
       list.add(SimCard(
         slotIndex: i,
         label: 'SIM $i',
-        operatorName: i == 1 ? 'Primary Network' : 'Secondary SIM',
+        operatorName: (savedOp != null && savedOp.isNotEmpty)
+            ? savedOp
+            : (i == 1 ? 'Primary Network' : 'SIM $i Standby'),
+        phoneNumber: savedNum,
         status: i == 1 ? SimStatus.ready : SimStatus.inserted,
         signalLevel: i == 1 ? 24 : 18,
         isActive: i == activeSimSlot,
@@ -208,6 +219,32 @@ class BTBuddyService {
     }
     simCards = list;
     _simController.add(simCards);
+  }
+
+  Future<void> updateSimCardDetails(int slotIndex, {String? operatorName, String? phoneNumber}) async {
+    if (slotIndex < 1 || slotIndex > simSlotCount) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (operatorName != null) {
+        await prefs.setString('btbuddy.sim_operator_$slotIndex', operatorName.trim());
+      }
+      if (phoneNumber != null) {
+        await prefs.setString('btbuddy.sim_number_$slotIndex', phoneNumber.trim());
+      }
+    } catch (_) {}
+
+    simCards = simCards.map((sim) {
+      if (sim.slotIndex == slotIndex) {
+        return sim.copyWith(
+          operatorName: operatorName != null && operatorName.trim().isNotEmpty ? operatorName.trim() : sim.operatorName,
+          phoneNumber: phoneNumber != null && phoneNumber.trim().isNotEmpty ? phoneNumber.trim() : sim.phoneNumber,
+        );
+      }
+      return sim;
+    }).toList();
+
+    _simController.add(simCards);
+    _emit('info', 'Updated SIM $slotIndex details: ${simCards[slotIndex - 1].operatorName} (${simCards[slotIndex - 1].phoneNumber ?? 'No number'})');
   }
 
   Future<void> setSimSlotCount(int count) async {
@@ -308,10 +345,12 @@ class BTBuddyService {
   // -------------------------------------------------------------
   // 2-WAY HEARTBEAT & TELEMETRY
   // -------------------------------------------------------------
+  bool isExecutingCommand = false;
+
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 4), (_) async {
-      if (!connected) return;
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
+      if (!connected || isExecutingCommand) return;
       final stopwatch = Stopwatch()..start();
       try {
         await command('AT+CSQ');
@@ -447,11 +486,16 @@ class BTBuddyService {
   }
 
   Future<String> command(String command) async {
-    final response = await _method.invokeMethod<String>(
-      'command',
-      {'command': command},
-    );
-    return response ?? '';
+    isExecutingCommand = true;
+    try {
+      final response = await _method.invokeMethod<String>(
+        'command',
+        {'command': command},
+      );
+      return response ?? '';
+    } finally {
+      isExecutingCommand = false;
+    }
   }
 
   // -------------------------------------------------------------
@@ -579,6 +623,50 @@ class BTBuddyService {
   }
 
   // -------------------------------------------------------------
+  // BT DIALER COMPANION FUNCTIONS (Anti-Lost, Volume, Mic, Camera)
+  // -------------------------------------------------------------
+  Future<void> ringPhoneAntiLost() async {
+    if (!connected) return;
+    _emit('info', 'Triggering Find My Phone / Anti-Lost Alarm on connected device…');
+    try {
+      // Set volume to max
+      await command('AT+CLVL=100');
+      await command('AT+CRSL=100');
+      await command('AT+CALM=2'); // Vibrate mode
+      // Generate tone sequence
+      await command('AT+VTS=1,2,3,4,5,6,7,8,9,0,*');
+      await Future.delayed(const Duration(milliseconds: 200));
+      await command('AT+VTD=10');
+    } catch (_) {}
+    _emit('info', 'Find My Phone alarm sequence broadcast to handset.');
+  }
+
+  Future<String> setPhoneSpeakerVolume(int level) async {
+    final clamped = level.clamp(0, 100);
+    final resp = await command('AT+CLVL=$clamped');
+    try {
+      await command('AT+CRSL=$clamped');
+    } catch (_) {}
+    _emit('info', 'Phone speaker volume set to $clamped%');
+    return resp;
+  }
+
+  Future<String> setMutePhoneMic(bool mute) async {
+    final resp = await command('AT+CMUT=${mute ? 1 : 0}');
+    _emit('info', 'Phone microphone ${mute ? 'MUTED' : 'UNMUTED'}');
+    return resp;
+  }
+
+  Future<String> triggerRemoteCamera() async {
+    _emit('info', 'Triggering remote camera shutter over Bluetooth…');
+    try {
+      final r1 = await command('AT+CKPD="[PHOTO]"');
+      if (r1.contains('OK')) return r1;
+    } catch (_) {}
+    return command('AT+CKPD="[CAMERA]"');
+  }
+
+  // -------------------------------------------------------------
   // CALLS & PHONEBOOK
   // -------------------------------------------------------------
   Future<String> ping() => command('AT');
@@ -650,18 +738,57 @@ class BTBuddyService {
   Future<List<SimCard>> detectSimCards() async {
     if (!connected) return simCards;
 
-    _emit('info', 'Probing cellular SIM slots ($simSlotCount slots)…');
+    _emit('info', 'Probing cellular SIM slots ($simSlotCount slots), company names & subscriber numbers…');
     final updated = <SimCard>[];
 
-    // Probe current operator
+    SharedPreferences? prefs;
+    try {
+      prefs = await SharedPreferences.getInstance();
+    } catch (_) {}
+
+    // 1. Probe Operator Name (Company)
     String mainOperator = 'Network Provider';
     try {
       final ops = await operatorName();
       final match = RegExp(r'\+COPS:\s*\d+,\s*\d+,\s*"([^"]+)"').firstMatch(ops);
-      if (match != null) mainOperator = match.group(1) ?? mainOperator;
+      if (match != null && (match.group(1)?.isNotEmpty ?? false)) {
+        mainOperator = match.group(1)!;
+      }
     } catch (_) {}
 
-    // Probe signal quality
+    // 2. Probe Subscriber Phone Numbers (AT+CNUM)
+    final Map<int, String> detectedNumbers = {};
+    try {
+      final cnumResp = await command('AT+CNUM');
+      final cnumMatches = RegExp(r'\+CNUM:\s*"([^"]*)",\s*"([^"]+)"').allMatches(cnumResp);
+      int slotIdx = 1;
+      for (final m in cnumMatches) {
+        final num = m.group(2) ?? '';
+        if (num.isNotEmpty) {
+          detectedNumbers[slotIdx] = num;
+          slotIdx++;
+        }
+      }
+    } catch (_) {}
+
+    // 3. Fallback to Own Numbers storage (AT+CPBS="ON") if CNUM didn't find numbers
+    if (detectedNumbers.isEmpty) {
+      try {
+        await command('AT+CPBS="ON"');
+        final onResp = await command('AT+CPBR=1,5');
+        final onMatches = RegExp(r'\+CPBR:\s*(\d+),\s*"([^"]+)"').allMatches(onResp);
+        for (final m in onMatches) {
+          final idx = int.tryParse(m.group(1) ?? '1') ?? 1;
+          final num = m.group(2) ?? '';
+          if (num.isNotEmpty) {
+            detectedNumbers[idx] = num;
+          }
+        }
+        await command('AT+CPBS="SM"');
+      } catch (_) {}
+    }
+
+    // 4. Probe Signal Quality
     int mainSignal = 24;
     try {
       final csq = await signalQuality();
@@ -685,10 +812,20 @@ class BTBuddyService {
         }
       } catch (_) {}
 
+      final savedOp = prefs?.getString('btbuddy.sim_operator_$i');
+      final savedNum = prefs?.getString('btbuddy.sim_number_$i');
+      final detectedNum = detectedNumbers[i];
+
+      final finalOp = (savedOp != null && savedOp.isNotEmpty)
+          ? savedOp
+          : (i == 1 ? mainOperator : (simSlotCount > 1 ? 'Secondary SIM' : mainOperator));
+      final finalNum = (savedNum != null && savedNum.isNotEmpty) ? savedNum : detectedNum;
+
       updated.add(SimCard(
         slotIndex: i,
         label: 'SIM $i',
-        operatorName: i == 1 ? mainOperator : (simSlotCount > 1 ? 'SIM $i Standby' : 'Network Provider'),
+        operatorName: finalOp,
+        phoneNumber: finalNum,
         status: status,
         signalLevel: i == 1 ? mainSignal : (mainSignal > 6 ? mainSignal - 4 : mainSignal),
         isActive: i == activeSimSlot,
@@ -702,65 +839,57 @@ class BTBuddyService {
 
   Future<String> dialWithSim(String number, {int? simSlot}) async {
     final slot = simSlot ?? activeSimSlot;
-    if (slot != activeSimSlot) {
-      await setActiveSim(slot);
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
+    final clean = number.replaceAll(RegExp(r'[^\d+*#]'), '');
+    if (clean.isEmpty) return 'ERROR: Invalid phone number';
 
-    final clean = number.trim();
+    _emit('info', 'Placing call to $clean on SIM $slot…');
 
-    // Multi-SIM dial strategy:
-    // Ensure hardware SIM slot is selected
-    if (slot > 1) {
+    if (slot <= 1) {
+      // 1. Direct standard voice dial with semicolon: ATD<number>;
       try {
-        await command('AT+ESUO=$slot');
+        final resp = await command('ATD$clean;');
+        if (!resp.contains('ERROR') && !resp.contains('NO CARRIER')) {
+          return resp;
+        }
       } catch (_) {}
-      try {
-        await command('AT+CSUS=${slot - 1}');
-      } catch (_) {}
-      try {
-        await command('AT+DSIM=$slot');
-      } catch (_) {}
-    } else {
-      try {
-        await command('AT+ESUO=1');
-      } catch (_) {}
-      try {
-        await command('AT+CSUS=0');
-      } catch (_) {}
-      try {
-        await command('AT+DSIM=1');
-      } catch (_) {}
-    }
 
-    await Future.delayed(const Duration(milliseconds: 60));
-
-    // 1. Primary dial: ATD<number>;
-    String resp = '';
-    try {
-      resp = await dial(clean);
-      if (resp.contains('OK') || !resp.contains('ERROR')) {
-        return resp;
-      }
-    } catch (_) {}
-
-    // 2. If slot > 1 and primary dial returned error, try suffix dial: ATD<number>;2 or ATD><number>;2
-    if (slot > 1) {
+      // 2. Direct voice dial without semicolon
       try {
-        final r2 = await command('ATD$clean;$slot');
+        final r1 = await command('ATD$clean');
+        if (!r1.contains('ERROR') && !r1.contains('NO CARRIER')) {
+          return r1;
+        }
+      } catch (_) {}
+
+      // 3. Bluetooth Companion Call format
+      try {
+        final r2 = await command('AT+BTDIAL="$clean"');
         if (r2.contains('OK') || !r2.contains('ERROR')) return r2;
       } catch (_) {}
-      try {
-        final r3 = await command('ATD$clean;,$slot');
-        if (r3.contains('OK') || !r3.contains('ERROR')) return r3;
-      } catch (_) {}
-      try {
-        final r4 = await command('AT+CDV=$clean');
-        if (r4.contains('OK') || !r4.contains('ERROR')) return r4;
-      } catch (_) {}
-    }
 
-    return resp.isNotEmpty ? resp : await dial(clean);
+      return await command('ATD$clean;');
+    } else {
+      // Multi-SIM calling
+      try {
+        await setActiveSim(slot);
+      } catch (_) {}
+
+      try {
+        final resp = await command('ATD$clean;$slot');
+        if (!resp.contains('ERROR') && !resp.contains('NO CARRIER')) {
+          return resp;
+        }
+      } catch (_) {}
+
+      try {
+        final r2 = await command('ATD$clean;');
+        if (!r2.contains('ERROR') && !r2.contains('NO CARRIER')) {
+          return r2;
+        }
+      } catch (_) {}
+
+      return await command('ATD$clean;');
+    }
   }
 
   Future<String> sendSmsWithSim(String number, String message, {int? simSlot}) async {

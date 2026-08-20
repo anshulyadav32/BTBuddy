@@ -168,7 +168,7 @@ enum USBDeviceManager {
             let rawName = URL(fileURLWithPath: path).lastPathComponent
                 .replacingOccurrences(of: "cu.", with: "")
                 .replacingOccurrences(of: "tty.", with: "")
-            var isBt = lower.contains("bluetooth") || lower.contains("bt")
+            var isBt = lower.contains("bluetooth") || lower.contains("bt") || lower.contains("kechaoda")
             var isUsb = lower.contains("usb") || lower.contains("slab") || lower.contains("wch")
             var dName = rawName
             var manufacturer = isBt ? "Bluetooth Serial Device" : (isUsb ? "USB Serial Device" : "Serial Device")
@@ -179,16 +179,23 @@ enum USBDeviceManager {
             for (btName, status) in btDevices {
                 let sanitizedBtName = btName.replacingOccurrences(of: " ", with: "").lowercased()
                 let sanitizedPath = lower.replacingOccurrences(of: "-", with: "").replacingOccurrences(of: "_", with: "")
-                if sanitizedPath.contains(sanitizedBtName) || sanitizedBtName.contains(sanitizedPath) || lower.contains(btName.lowercased()) {
+                if sanitizedPath.contains(sanitizedBtName) || sanitizedBtName.contains(sanitizedPath) || lower.contains(btName.lowercased()) || (lower.contains("kechaoda") && btName.lowercased().contains("kechaoda")) {
                     isBt = true
                     isUsb = false
-                    dName = status.realName
+                    dName = status.realName.isEmpty ? "KECHAODA Phone" : status.realName
                     btConn = status.connected
                     btPair = status.paired
                     btAddr = status.address
                     manufacturer = "Bluetooth (" + (status.isPhone ? "Mobile Phone" : "Endpoint") + ")"
                     break
                 }
+            }
+
+            if lower.contains("kechaoda") && dName == rawName {
+                isBt = true
+                isUsb = false
+                dName = "KECHAODA Phone (Bluetooth SPP)"
+                manufacturer = "Bluetooth Mobile Phone"
             }
 
             if lower.contains("bluetooth-incoming") {
@@ -268,7 +275,7 @@ enum USBDeviceManager {
             let isPaired = device.isPaired()
             let isFavorite = device.isFavorite()
             let deviceClass = Int(device.classOfDevice)
-            let rssi = Int(device.rawRSSI())
+            let rssi = connected ? Int(device.rawRSSI()) : 0
 
             list.append([
                 "name": name,
@@ -284,11 +291,11 @@ enum USBDeviceManager {
         if let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] {
             for device in paired { addDevice(device) }
         }
-        if let recent = IOBluetoothDevice.recentDevices(100) as? [IOBluetoothDevice] {
-            for device in recent { addDevice(device) }
-        }
         if let favs = IOBluetoothDevice.favoriteDevices() as? [IOBluetoothDevice] {
             for device in favs { addDevice(device) }
+        }
+        if let recent = IOBluetoothDevice.recentDevices(20) as? [IOBluetoothDevice] {
+            for device in recent { addDevice(device) }
         }
 
         return list.sorted {

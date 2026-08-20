@@ -27,7 +27,7 @@ class _BTBuddyAppState extends State<BTBuddyApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BTBuddy',
+      title: 'ControlBuddy',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
